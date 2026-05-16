@@ -1,0 +1,56 @@
+# Development
+
+## Local Dependencies
+
+Install Python 3.11 or newer, then create a virtual environment in the project root:
+
+```powershell
+cd G:\33258\Desktop\Monitor
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+The current MVP intentionally avoids a frontend build step. The WebUI is plain static HTML/CSS/JS served by the Python server.
+
+## Run Server
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m server.monitor_server --config server.yaml
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000
+```
+
+Use this development login:
+
+```text
+username: admin
+password: dev-admin-password
+```
+
+## Run Agent
+
+Open another terminal:
+
+```powershell
+cd G:\33258\Desktop\Monitor
+.\.venv\Scripts\Activate.ps1
+python -m agent.monitor_agent --config agent.yaml
+```
+
+On Windows, the agent can still send basic host metrics. Docker data is primarily intended for Linux hosts with Docker Engine available.
+
+## Production Direction
+
+For production:
+
+- Put the server behind Caddy or Nginx.
+- Use HTTPS/WSS.
+- Replace static development tokens with per-agent tokens.
+- Run the Linux agent as a `systemd` service.
+- Restrict Docker command actions to a strict allowlist.

@@ -1,0 +1,16 @@
+[Unit]
+Description=Monitor Agent
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/monitor
+ExecStart=/opt/monitor/.venv/bin/python -m agent.monitor_agent --config /etc/monitor/agent.yaml
+Restart=always
+RestartSec=5
+User=monitor
+Group=monitor
+
+[Install]
+WantedBy=multi-user.target

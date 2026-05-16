@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Monitor</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <section id="login-view" class="auth-screen">
+      <div class="auth-card">
+        <div class="brand-mark">M</div>
+        <h1>Monitor</h1>
+        <p>登录中心控制台，查看 Linux 节点状态并管理 Docker 容器。</p>
+        <form id="login-form" class="auth-form">
+          <label>
+            用户名
+            <input id="login-username" name="username" autocomplete="username" value="admin" />
+          </label>
+          <label>
+            密码
+            <input id="login-password" name="password" type="password" autocomplete="current-password" />
+          </label>
+          <button type="submit" class="primary-button">登录</button>
+        </form>
+        <div class="auth-hint">开发默认账号：admin / dev-admin-password</div>
+      </div>
+    </section>
+
+    <section id="app-view" class="app-shell is-hidden">
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <div class="brand-mark">M</div>
+          <div>
+            <strong>Monitor</strong>
+            <span>Control Plane</span>
+          </div>
+        </div>
+
+        <nav class="nav-list" aria-label="main navigation">
+          <a class="active" href="#overview">Overview</a>
+          <a href="#containers">Containers</a>
+          <a href="#commands">Commands</a>
+          <a href="#audit">Audit</a>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div>
+            <span class="small-label">WebSocket</span>
+            <strong id="ws-state">disconnected</strong>
+          </div>
+          <button id="logout" type="button">退出</button>
+        </div>
+      </aside>
+
+      <main class="main-stage">
+        <header class="page-header">
+          <div>
+            <span class="eyebrow">Distributed Monitoring</span>
+            <h1>服务器监控台</h1>
+          </div>
+          <div class="header-actions">
+            <span id="current-user" class="user-pill"></span>
+            <button id="refresh" type="button">刷新</button>
+          </div>
+        </header>
+
+        <section id="overview" class="overview-grid">
+          <article class="stat-card">
+            <span>节点总数</span>
+            <strong id="node-count">0</strong>
+            <em>registered agents</em>
+          </article>
+          <article class="stat-card success">
+            <span>在线节点</span>
+            <strong id="online-count">0</strong>
+            <em>healthy connections</em>
+          </article>
+          <article class="stat-card accent">
+            <span>容器数量</span>
+            <strong id="container-count">0</strong>
+            <em>visible containers</em>
+          </article>
+          <article class="stat-card warning">
+            <span>命令记录</span>
+            <strong id="command-count">0</strong>
+            <em>recent operations</em>
+          </article>
+        </section>
+
+        <section class="dashboard-grid">
+          <section class="panel node-panel">
+            <div class="panel-title">
+              <div>
+                <h2>节点</h2>
+                <p>Agent 心跳与主机信息</p>
+              </div>
+            </div>
+            <div id="nodes" class="node-list"></div>
+          </section>
+
+          <section class="panel metric-panel">
+            <div class="panel-title">
+              <div>
+                <h2 id="selected-node-title">未选择节点</h2>
+                <p id="selected-node-meta">等待 Agent 连接</p>
+              </div>
+              <span id="selected-node-status" class="status-chip neutral">unknown</span>
+            </div>
+            <div class="mini-metrics">
+              <div><span>CPU</span><strong id="mini-cpu">-</strong></div>
+              <div><span>Memory</span><strong id="mini-memory">-</strong></div>
+              <div><span>Disk</span><strong id="mini-disk">-</strong></div>
+              <div><span>Docker</span><strong id="mini-docker">-</strong></div>
+            </div>
+            <canvas id="metric-chart" width="960" height="300"></canvas>
+          </section>
+        </section>
+
+        <section id="containers" class="panel">
+          <div class="panel-title">
+            <div>
+              <h2>容器</h2>
+              <p>Start、Stop、Restart 命令会通过已连接的 Agent 下发</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>镜像</th>
+                  <th>状态</th>
+                  <th>CPU</th>
+                  <th>内存</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="containers-table"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="activity-grid">
+          <section id="commands" class="panel">
+            <div class="panel-title">
+              <div>
+                <h2>命令</h2>
+                <p>最近的远程操作</p>
+              </div>
+            </div>
+            <div id="commands-list" class="event-list"></div>
+          </section>
+
+          <section id="audit" class="panel">
+            <div class="panel-title">
+              <div>
+                <h2>审计</h2>
+                <p>谁在什么时候做了什么</p>
+              </div>
+            </div>
+            <div id="audit-list" class="event-list"></div>
+          </section>
+        </section>
+      </main>
+    </section>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
