@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import ServerConfig
 from .db import Database
 from .hub import ConnectionHub
-from .security import create_session_token, require_admin_token
+from .security import create_session_token, require_admin_token, verify_admin_token
 
 
 ALLOWED_COMMANDS = {
@@ -162,7 +162,7 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.websocket("/ws/ui")
     async def ui_ws(websocket: WebSocket) -> None:
         token = websocket.query_params.get("token")
-        if token != config.admin_token:
+        if not verify_admin_token(config, token):
             await websocket.close(code=1008)
             return
         await websocket.accept()
@@ -244,4 +244,3 @@ async def _status_watcher(app: FastAPI) -> None:
         )
         for change in changes:
             await app.state.hub.broadcast_ui({"type": "node_status_changed", **change})
-
