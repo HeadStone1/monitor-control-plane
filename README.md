@@ -2,6 +2,13 @@
 
 Lightweight distributed Linux and Docker monitoring MVP.
 
+## Project Note
+
+This project is a vibe coding prototype for a lightweight distributed
+monitoring and Docker control plane. The first version focuses on validating
+the Agent -> Server -> WebUI workflow before evolving into a production-ready
+system.
+
 This repository contains three parts:
 
 - `agent`: runs on monitored Linux servers, collects host and Docker data, and executes container commands.
@@ -17,6 +24,16 @@ This repository contains three parts:
 - Static HTML/CSS/JS WebUI for zero frontend build tooling
 - JSON messages over WebSocket
 - TLS-ready transport via HTTPS/WSS behind Caddy, Nginx, or another reverse proxy
+
+## License
+
+This project is source-available under the Monitor Personal Use License v0.1.
+
+- Personal, educational, research, and other non-commercial use is allowed.
+- Commercial use requires prior written authorization from the copyright holder.
+- This is not an OSI open source license.
+
+See [LICENSE](LICENSE) for details.
 
 ## Quick Start
 
