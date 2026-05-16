@@ -1,0 +1,13 @@
+server_url: ws://127.0.0.1:8000/agent/ws
+agent_id: dev-agent
+agent_name: dev-agent
+token: dev-agent-token
+tls_verify: true
+intervals:
+  heartbeat: 10
+  metrics: 5
+  docker_stats: 5
+  docker_inventory: 30
+  host_info: 60
+docker:
+  enabled: true
