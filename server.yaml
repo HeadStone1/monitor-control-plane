@@ -1,0 +1,13 @@
+host: 127.0.0.1
+port: 8000
+database_path: data/monitor.db
+admin_token: dev-admin-token
+admin_username: admin
+admin_password: dev-admin-password
+session_secret: dev-session-secret-change-me
+session_ttl_hours: 12
+agent_tokens:
+  - dev-agent-token
+heartbeat:
+  warning_after_seconds: 30
+  offline_after_seconds: 60
