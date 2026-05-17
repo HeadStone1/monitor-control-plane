@@ -7,17 +7,26 @@ Install Python 3.11 or newer, then create a virtual environment in the project r
 ```powershell
 cd G:\33258\Desktop\Monitor
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+The command uses the Python inside `.venv`, so dependencies stay inside the project virtual environment.
+
 The current MVP intentionally avoids a frontend build step. The WebUI is plain static HTML/CSS/JS served by the Python server.
+
+## Local Config
+
+```powershell
+Copy-Item server.example.yaml server.yaml
+Copy-Item agent.example.yaml agent.yaml
+```
+
+Then replace the default passwords, tokens, and `session_secret` in both files. Keep `server.yaml` and `agent.yaml` out of Git.
 
 ## Run Server
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
-python -m server.monitor_server --config server.yaml
+.\.venv\Scripts\python.exe -m server.monitor_server --config server.yaml
 ```
 
 Then open:
@@ -26,31 +35,22 @@ Then open:
 http://127.0.0.1:8000
 ```
 
-Use this development login:
-
-```text
-username: admin
-password: dev-admin-password
-```
-
 ## Run Agent
 
 Open another terminal:
 
 ```powershell
 cd G:\33258\Desktop\Monitor
-.\.venv\Scripts\Activate.ps1
-python -m agent.monitor_agent --config agent.yaml
+.\.venv\Scripts\python.exe -m agent.monitor_agent --config agent.yaml
 ```
 
 On Windows, the agent can still send basic host metrics. Docker data is primarily intended for Linux hosts with Docker Engine available.
 
 ## Production Direction
 
-For production:
-
 - Put the server behind Caddy or Nginx.
 - Use HTTPS/WSS.
 - Replace static development tokens with per-agent tokens.
+- Store admin passwords as hashes.
 - Run the Linux agent as a `systemd` service.
 - Restrict Docker command actions to a strict allowlist.

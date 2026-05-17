@@ -1,11 +1,14 @@
 const state = {
-  token: localStorage.getItem("monitor.sessionToken") || "",
-  username: localStorage.getItem("monitor.username") || "",
+  username: "",
   nodes: [],
   containers: [],
   commands: [],
   auditLogs: [],
   metrics: [],
+  metricPayload: null,
+  metricRange: localStorage.getItem("monitor.metricRange") || "1h",
+  thresholds: loadThresholds(),
+  chartModel: null,
   selectedNodeId: localStorage.getItem("monitor.selectedNodeId") || null,
   ws: null,
   refreshTimer: null,
@@ -36,21 +39,32 @@ const els = {
   miniMemory: document.querySelector("#mini-memory"),
   miniDisk: document.querySelector("#mini-disk"),
   miniDocker: document.querySelector("#mini-docker"),
+  metricRange: document.querySelector("#metric-range"),
+  thresholdCpu: document.querySelector("#threshold-cpu"),
+  thresholdMemory: document.querySelector("#threshold-memory"),
+  thresholdDisk: document.querySelector("#threshold-disk"),
+  metricSummary: document.querySelector("#metric-summary"),
   chart: document.querySelector("#metric-chart"),
+  chartTooltip: document.querySelector("#chart-tooltip"),
   toast: document.querySelector("#toast"),
 };
 
 els.loginForm.addEventListener("submit", login);
-els.logout.addEventListener("click", logout);
+els.logout.addEventListener("click", () => logout());
 els.refresh.addEventListener("click", refreshAll);
+els.metricRange.addEventListener("click", changeMetricRange);
+els.thresholdCpu.addEventListener("input", () => updateThreshold("cpu", els.thresholdCpu.value));
+els.thresholdMemory.addEventListener("input", () => updateThreshold("memory", els.thresholdMemory.value));
+els.thresholdDisk.addEventListener("input", () => updateThreshold("disk", els.thresholdDisk.value));
+els.chart.addEventListener("mousemove", showChartTooltip);
+els.chart.addEventListener("mouseleave", hideChartTooltip);
 
 boot();
 
 async function boot() {
-  if (!state.token) {
-    showLogin();
-    return;
-  }
+  localStorage.removeItem("monitor.sessionToken");
+  localStorage.removeItem("monitor.username");
+  renderMetricControls();
 
   try {
     const profile = await api("/api/auth/me");
@@ -60,7 +74,7 @@ async function boot() {
     await refreshAll();
     state.refreshTimer = setInterval(refreshAll, 5000);
   } catch {
-    logout(false);
+    showLogin();
   }
 }
 
@@ -72,23 +86,21 @@ async function login(event) {
   try {
     const response = await fetch("/api/auth/login", {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
     });
     if (!response.ok) {
-      throw new Error("用户名或密码不正确");
+      throw new Error("Invalid username or password.");
     }
     const data = await response.json();
-    state.token = data.token;
     state.username = data.username;
-    localStorage.setItem("monitor.sessionToken", state.token);
-    localStorage.setItem("monitor.username", state.username);
     showApp();
     connectWs();
     await refreshAll();
     state.refreshTimer = setInterval(refreshAll, 5000);
   } catch (error) {
-    showToast(error.message || "登录失败");
+    showToast(error.message || "Sign in failed.");
   }
 }
 
@@ -97,17 +109,19 @@ function logout(showMessage = true) {
     state.ws.close();
   }
   clearInterval(state.refreshTimer);
-  state.token = "";
   state.username = "";
   state.nodes = [];
   state.containers = [];
   state.commands = [];
   state.auditLogs = [];
   state.metrics = [];
+  state.metricPayload = null;
+  state.chartModel = null;
+  fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
   localStorage.removeItem("monitor.sessionToken");
   localStorage.removeItem("monitor.username");
   showLogin();
-  if (showMessage) showToast("已退出登录");
+  if (showMessage) showToast("Signed out.");
 }
 
 function showLogin() {
@@ -118,21 +132,21 @@ function showLogin() {
 function showApp() {
   els.loginView.classList.add("is-hidden");
   els.appView.classList.remove("is-hidden");
-  els.currentUser.textContent = state.username ? `当前用户：${state.username}` : "";
+  els.currentUser.textContent = state.username ? `Signed in as ${state.username}` : "";
 }
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
+    credentials: "same-origin",
     headers: {
-      Authorization: `Bearer ${state.token}`,
       "Content-Type": "application/json",
       ...(options.headers || {}),
     },
   });
   if (response.status === 401) {
     logout(false);
-    throw new Error("登录已过期，请重新登录");
+    throw new Error("Session expired. Sign in again.");
   }
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
@@ -145,21 +159,30 @@ function connectWs() {
     state.ws.close();
   }
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const url = `${protocol}//${window.location.host}/ws/ui?token=${encodeURIComponent(state.token)}`;
+  const url = `${protocol}//${window.location.host}/ws/ui`;
   const ws = new WebSocket(url);
   state.ws = ws;
   setWsState("connecting");
 
-  ws.addEventListener("open", () => setWsState("connected"));
+  ws.addEventListener("open", () => {
+    ws.send(JSON.stringify({ type: "auth" }));
+  });
   ws.addEventListener("close", () => {
     setWsState("disconnected");
-    if (state.token) {
+    if (state.username) {
       setTimeout(() => {
         if (state.ws === ws) connectWs();
       }, 3000);
     }
   });
-  ws.addEventListener("message", () => refreshAll());
+  ws.addEventListener("message", (event) => {
+    const message = safeJson(event.data);
+    if (message?.type === "auth_ok") {
+      setWsState("connected");
+      return;
+    }
+    refreshAll();
+  });
 }
 
 function setWsState(value) {
@@ -167,7 +190,7 @@ function setWsState(value) {
 }
 
 async function refreshAll() {
-  if (!state.token) return;
+  if (!state.username) return;
 
   try {
     const [nodes, commands, auditLogs] = await Promise.all([
@@ -190,12 +213,13 @@ async function refreshAll() {
       ? `/api/containers?node_id=${encodeURIComponent(state.selectedNodeId)}`
       : "/api/containers";
     state.containers = await api(containerPath);
-    state.metrics = state.selectedNodeId
-      ? await api(`/api/nodes/${encodeURIComponent(state.selectedNodeId)}/metrics?limit=120`)
-      : [];
+    state.metricPayload = state.selectedNodeId
+      ? await api(`/api/nodes/${encodeURIComponent(state.selectedNodeId)}/metrics?range=${encodeURIComponent(state.metricRange)}`)
+      : null;
+    state.metrics = state.metricPayload?.points || [];
     render();
   } catch (error) {
-    showToast(`刷新失败：${error.message}`);
+    showToast(`Refresh failed: ${error.message}`);
   }
 }
 
@@ -213,6 +237,8 @@ function render() {
   renderOverview();
   renderNodes();
   renderSelectedNode();
+  renderMetricControls();
+  renderMetricSummary();
   renderChart(state.metrics);
   renderContainers();
   renderEvents();
@@ -225,42 +251,101 @@ function renderOverview() {
   els.commandCount.textContent = state.commands.length;
 }
 
+function renderMetricControls() {
+  els.metricRange.querySelectorAll("[data-range]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.range === state.metricRange);
+  });
+  els.thresholdCpu.value = state.thresholds.cpu ?? "";
+  els.thresholdMemory.value = state.thresholds.memory ?? "";
+  els.thresholdDisk.value = state.thresholds.disk ?? "";
+}
+
+function changeMetricRange(event) {
+  const button = event.target.closest("[data-range]");
+  if (!button) return;
+  state.metricRange = button.dataset.range;
+  localStorage.setItem("monitor.metricRange", state.metricRange);
+  renderMetricControls();
+  refreshAll();
+}
+
+function updateThreshold(metric, rawValue) {
+  const value = String(rawValue).trim();
+  if (value === "") {
+    state.thresholds[metric] = null;
+  } else {
+    const number = Number(value);
+    state.thresholds[metric] = Number.isFinite(number) ? Math.max(0, Math.min(100, number)) : null;
+  }
+  localStorage.setItem("monitor.thresholds", JSON.stringify(state.thresholds));
+  renderChart(state.metrics);
+}
+
+function renderMetricSummary() {
+  els.metricSummary.replaceChildren();
+  const summary = state.metricPayload?.summary;
+  const items = [
+    ["CPU", summary?.cpu],
+    ["Memory", summary?.memory],
+    ["Disk", summary?.disk],
+  ];
+  items.forEach(([label, item]) => {
+    const card = document.createElement("div");
+    card.className = "summary-item";
+    card.append(
+      createTextBlock("span", "", label),
+      createTextBlock("strong", "", `Avg ${percent(item?.avg)} / Max ${percent(item?.max)}`),
+      createTextBlock("em", "", `Peak ${formatDateTime(item?.peak_at)}`),
+    );
+    els.metricSummary.appendChild(card);
+  });
+}
+
 function renderNodes() {
+  els.nodes.replaceChildren();
   if (!state.nodes.length) {
-    els.nodes.innerHTML = `<div class="empty">还没有 Agent 连接。</div>`;
+    els.nodes.appendChild(createTextBlock("div", "empty", "No agents connected yet."));
     return;
   }
 
-  els.nodes.innerHTML = state.nodes
-    .map((node) => {
-      const active = node.id === state.selectedNodeId ? " active" : "";
-      return `
-        <button class="node-item${active}" type="button" data-node-id="${escapeHtml(node.id)}">
-          <span class="node-name-row">
-            <span class="node-name">${escapeHtml(node.name || node.id)}</span>
-            <span class="status-chip ${escapeHtml(node.status || "neutral")}">${escapeHtml(node.status || "unknown")}</span>
-          </span>
-          <span class="node-meta">${escapeHtml(node.hostname || "unknown host")} · ${escapeHtml(node.os || "unknown os")}</span>
-          <span class="node-metrics-row">
-            <span>CPU ${percent(node.latest_cpu_percent)}</span>
-            <span>MEM ${percent(node.latest_memory_percent)}</span>
-            <span>DISK ${percent(node.latest_disk_percent)}</span>
-          </span>
-        </button>
-      `;
-    })
-    .join("");
-
-  document.querySelectorAll("[data-node-id]").forEach((button) => {
+  state.nodes.forEach((node) => {
+    const button = document.createElement("button");
+    button.className = `node-item${node.id === state.selectedNodeId ? " active" : ""}`;
+    button.type = "button";
+    button.dataset.nodeId = String(node.id || "");
     button.addEventListener("click", () => selectNode(button.dataset.nodeId));
+
+    const nameRow = document.createElement("span");
+    nameRow.className = "node-name-row";
+    nameRow.append(
+      createTextBlock("span", "node-name", node.name || node.id),
+      createTextBlock("span", `status-chip ${statusClass(node.status)}`, node.status || "unknown"),
+    );
+
+    const meta = createTextBlock(
+      "span",
+      "node-meta",
+      `${node.hostname || "unknown host"} / ${node.os || "unknown os"}`,
+    );
+
+    const metricRow = document.createElement("span");
+    metricRow.className = "node-metrics-row";
+    metricRow.append(
+      createTextBlock("span", "", `CPU ${percent(node.latest_cpu_percent)}`),
+      createTextBlock("span", "", `MEM ${percent(node.latest_memory_percent)}`),
+      createTextBlock("span", "", `DISK ${percent(node.latest_disk_percent)}`),
+    );
+
+    button.append(nameRow, meta, metricRow);
+    els.nodes.appendChild(button);
   });
 }
 
 function renderSelectedNode() {
   const node = state.nodes.find((item) => item.id === state.selectedNodeId);
   if (!node) {
-    els.title.textContent = "未选择节点";
-    els.meta.textContent = "等待 Agent 连接";
+    els.title.textContent = "No node selected";
+    els.meta.textContent = "Waiting for an agent connection";
     els.status.textContent = "unknown";
     els.status.className = "status-chip neutral";
     els.miniCpu.textContent = "-";
@@ -271,9 +356,9 @@ function renderSelectedNode() {
   }
 
   els.title.textContent = node.name || node.id;
-  els.meta.textContent = `${node.id} · ${node.hostname || "unknown host"} · last seen ${node.last_seen || "never"}`;
+  els.meta.textContent = `${node.id} / ${node.hostname || "unknown host"} / last seen ${node.last_seen || "never"}`;
   els.status.textContent = node.status || "unknown";
-  els.status.className = `status-chip ${node.status || "neutral"}`;
+  els.status.className = `status-chip ${statusClass(node.status)}`;
   els.miniCpu.textContent = percent(node.latest_cpu_percent);
   els.miniMemory.textContent = percent(node.latest_memory_percent);
   els.miniDisk.textContent = percent(node.latest_disk_percent);
@@ -288,19 +373,24 @@ function renderChart(metrics) {
   const left = 52;
   const right = width - 24;
   const top = 36;
-  const bottom = height - 36;
+  const bottom = height - 48;
+  const series = [
+    ["CPU", "cpu_percent", "#1a73e8", state.thresholds.cpu],
+    ["Memory", "memory_percent", "#188038", state.thresholds.memory],
+    ["Disk", "disk_percent", "#f9ab00", state.thresholds.disk],
+  ];
 
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, width, height);
 
-  ctx.strokeStyle = "#dbe5ef";
+  ctx.strokeStyle = "#e0e3eb";
   ctx.lineWidth = 1;
-  ctx.fillStyle = "#68758a";
+  ctx.fillStyle = "#5f6368";
   ctx.font = "12px system-ui";
   for (let i = 0; i <= 4; i += 1) {
     const value = 100 - i * 25;
-    const y = top + ((bottom - top) * i) / 4;
+    const y = yForValue(value, top, bottom);
     ctx.beginPath();
     ctx.moveTo(left, y);
     ctx.lineTo(right, y);
@@ -308,17 +398,28 @@ function renderChart(metrics) {
     ctx.fillText(String(value), 16, y + 4);
   }
 
-  drawLegend(ctx);
+  drawTimeAxis(ctx, metrics, left, right, bottom);
+  drawLegend(ctx, series);
+  drawThresholds(ctx, series, left, right, top, bottom);
+  state.chartModel = {
+    left,
+    right,
+    top,
+    bottom,
+    points: metrics.map((point, index) => ({
+      point,
+      x: left + ((right - left) * index) / Math.max(1, metrics.length - 1),
+    })),
+  };
+
   if (!metrics.length) {
-    ctx.fillStyle = "#68758a";
+    ctx.fillStyle = "#5f6368";
     ctx.font = "14px system-ui";
-    ctx.fillText("暂无指标数据", left, 86);
+    ctx.fillText("No metrics yet", left, 86);
     return;
   }
 
-  drawSeries(ctx, metrics, "cpu_percent", "#1769aa", left, right, top, bottom);
-  drawSeries(ctx, metrics, "memory_percent", "#168052", left, right, top, bottom);
-  drawSeries(ctx, metrics, "disk_percent", "#b76d12", left, right, top, bottom);
+  series.forEach((item) => drawSeries(ctx, metrics, item[1], item[2], left, right, top, bottom));
 }
 
 function drawSeries(ctx, metrics, key, color, left, right, top, bottom) {
@@ -328,66 +429,164 @@ function drawSeries(ctx, metrics, key, color, left, right, top, bottom) {
   metrics.forEach((point, index) => {
     const value = Number(point[key] || 0);
     const x = left + ((right - left) * index) / Math.max(1, metrics.length - 1);
-    const y = bottom - ((bottom - top) * Math.min(100, Math.max(0, value))) / 100;
+    const y = yForValue(value, top, bottom);
     if (index === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
   ctx.stroke();
 }
 
-function drawLegend(ctx) {
-  const items = [
-    ["CPU", "#1769aa"],
-    ["Memory", "#168052"],
-    ["Disk", "#b76d12"],
-  ];
+function drawLegend(ctx, items) {
   ctx.font = "12px system-ui";
   items.forEach((item, index) => {
     const x = 56 + index * 96;
-    ctx.fillStyle = item[1];
+    ctx.fillStyle = item[2];
     ctx.fillRect(x, 17, 18, 4);
-    ctx.fillStyle = "#142033";
+    ctx.fillStyle = "#202124";
     ctx.fillText(item[0], x + 24, 22);
   });
 }
 
+function drawThresholds(ctx, items, left, right, top, bottom) {
+  ctx.save();
+  items.forEach((item) => {
+    const threshold = Number(item[3]);
+    if (!Number.isFinite(threshold)) return;
+    const y = yForValue(threshold, top, bottom);
+    ctx.strokeStyle = item[2];
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([6, 5]);
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(right, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = item[2];
+    ctx.font = "12px system-ui";
+    ctx.fillText(`${item[0]} ${threshold}%`, right - 86, y - 6);
+  });
+  ctx.restore();
+}
+
+function drawTimeAxis(ctx, metrics, left, right, bottom) {
+  ctx.save();
+  ctx.strokeStyle = "#e0e3eb";
+  ctx.fillStyle = "#5f6368";
+  ctx.lineWidth = 1;
+  ctx.font = "12px system-ui";
+  ctx.textBaseline = "top";
+
+  ctx.beginPath();
+  ctx.moveTo(left, bottom);
+  ctx.lineTo(right, bottom);
+  ctx.stroke();
+
+  pickAxisIndexes(metrics.length).forEach((index) => {
+    const point = metrics[index];
+    const x = left + ((right - left) * index) / Math.max(1, metrics.length - 1);
+    ctx.beginPath();
+    ctx.moveTo(x, bottom);
+    ctx.lineTo(x, bottom + 6);
+    ctx.stroke();
+
+    if (index === 0) ctx.textAlign = "left";
+    else if (index === metrics.length - 1) ctx.textAlign = "right";
+    else ctx.textAlign = "center";
+    ctx.fillText(formatAxisLabel(point?.captured_at || point?.bucket_start), x, bottom + 10);
+  });
+
+  ctx.restore();
+}
+
+function pickAxisIndexes(length) {
+  if (!length) return [];
+  if (length === 1) return [0];
+  const count = Math.min(5, length);
+  const indexes = new Set();
+  for (let i = 0; i < count; i += 1) {
+    indexes.add(Math.round((i * (length - 1)) / (count - 1)));
+  }
+  return [...indexes].sort((a, b) => a - b);
+}
+
+function formatAxisLabel(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+
+  if (state.metricRange === "1h") {
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+  if (state.metricRange === "7d") {
+    return date.toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit" });
+  }
+  return date.toLocaleDateString([], { month: "2-digit", day: "2-digit" });
+}
+
+function yForValue(value, top, bottom) {
+  const bounded = Math.min(100, Math.max(0, Number(value) || 0));
+  return bottom - ((bottom - top) * bounded) / 100;
+}
+
 function renderContainers() {
+  els.containers.replaceChildren();
   if (!state.containers.length) {
-    els.containers.innerHTML = `<tr><td colspan="6" class="empty">当前节点没有可见容器。</td></tr>`;
+    const row = document.createElement("tr");
+    const cell = createTextBlock("td", "empty", "No visible containers on the selected node.");
+    cell.colSpan = 6;
+    row.appendChild(cell);
+    els.containers.appendChild(row);
     return;
   }
 
-  els.containers.innerHTML = state.containers
-    .map((container) => {
-      const memory = bytes(container.memory_usage);
-      const limit = bytes(container.memory_limit);
-      return `
-        <tr>
-          <td class="name-cell" title="${escapeHtml(container.container_id)}">${escapeHtml(container.name || container.container_id)}</td>
-          <td>${escapeHtml(container.image || "-")}</td>
-          <td><span class="status-chip ${escapeHtml(container.status || "neutral")}">${escapeHtml(container.status || "-")}</span></td>
-          <td>${percent(container.cpu_percent)}</td>
-          <td>${memory}${container.memory_limit ? ` / ${limit}` : ""}</td>
-          <td>
-            <div class="action-row">
-              <button type="button" data-action="container.start" data-container="${escapeHtml(container.container_id)}">Start</button>
-              <button type="button" data-action="container.stop" data-container="${escapeHtml(container.container_id)}" class="danger">Stop</button>
-              <button type="button" data-action="container.restart" data-container="${escapeHtml(container.container_id)}">Restart</button>
-            </div>
-          </td>
-        </tr>
-      `;
-    })
-    .join("");
+  state.containers.forEach((container) => {
+    const row = document.createElement("tr");
+    const name = createTextBlock("td", "name-cell", container.name || container.container_id);
+    name.title = String(container.container_id || "");
 
-  document.querySelectorAll("[data-action]").forEach((button) => {
-    button.addEventListener("click", () => sendCommand(button.dataset.action, button.dataset.container));
+    const statusCell = document.createElement("td");
+    statusCell.appendChild(createTextBlock("span", `status-chip ${statusClass(container.status)}`, container.status || "-"));
+
+    const actions = document.createElement("td");
+    const actionRow = document.createElement("div");
+    actionRow.className = "action-row";
+    actionRow.append(
+      createActionButton("Start", "container.start", container.container_id),
+      createActionButton("Stop", "container.stop", container.container_id, "danger"),
+      createActionButton("Restart", "container.restart", container.container_id),
+    );
+    actions.appendChild(actionRow);
+
+    row.append(
+      name,
+      createTextBlock("td", "", container.image || "-"),
+      statusCell,
+      createTextBlock("td", "", percent(container.cpu_percent)),
+      createTextBlock(
+        "td",
+        "",
+        `${bytes(container.memory_usage)}${container.memory_limit ? ` / ${bytes(container.memory_limit)}` : ""}`,
+      ),
+      actions,
+    );
+    els.containers.appendChild(row);
   });
+}
+
+function createActionButton(label, action, containerId, className = "") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  if (className) button.className = className;
+  button.dataset.action = action;
+  button.dataset.container = String(containerId || "");
+  button.addEventListener("click", () => sendCommand(button.dataset.action, button.dataset.container));
+  return button;
 }
 
 async function sendCommand(action, containerId) {
   if (!state.selectedNodeId) {
-    showToast("请先选择一个节点");
+    showToast("Select a node first.");
     return;
   }
   const confirmed = window.confirm(`${action} ${containerId}?`);
@@ -401,40 +600,143 @@ async function sendCommand(action, containerId) {
         payload: { container_id: containerId },
       }),
     });
-    showToast("命令已提交");
+    showToast("Command submitted.");
     await refreshAll();
   } catch (error) {
-    showToast(`命令失败：${error.message}`);
+    showToast(`Command failed: ${error.message}`);
   }
 }
 
 function renderEvents() {
-  els.commands.innerHTML = renderEventList(
+  renderEventList(
+    els.commands,
     state.commands,
-    (item) => `${item.action} · ${item.status}`,
-    (item) => `${item.node_id} · ${item.created_at} · ${item.result_message || ""}`,
-    "还没有命令记录。",
+    (item) => `${item.action} / ${item.status}`,
+    (item) => `${item.node_id} / ${item.created_at} / ${item.result_message || ""}`,
+    "No commands yet.",
   );
-  els.auditLogs.innerHTML = renderEventList(
+  renderEventList(
+    els.auditLogs,
     state.auditLogs,
-    (item) => `${item.action} · ${item.result || ""}`,
-    (item) => `${item.user} · ${item.node_id || "-"} · ${item.created_at}`,
-    "还没有审计日志。",
+    (item) => `${item.action} / ${item.result || ""}`,
+    (item) => `${item.user} / ${item.node_id || "-"} / ${item.created_at}`,
+    "No audit logs yet.",
   );
 }
 
-function renderEventList(items, title, detail, emptyText) {
-  if (!items.length) return `<div class="empty">${emptyText}</div>`;
-  return items
-    .map(
-      (item) => `
-        <div class="event-item">
-          <strong>${escapeHtml(title(item))}</strong>
-          <span>${escapeHtml(detail(item))}</span>
-        </div>
-      `,
-    )
-    .join("");
+function renderEventList(target, items, title, detail, emptyText) {
+  target.replaceChildren();
+  if (!items.length) {
+    target.appendChild(createTextBlock("div", "empty", emptyText));
+    return;
+  }
+  items.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "event-item";
+    row.append(
+      createTextBlock("strong", "", title(item)),
+      createTextBlock("span", "", detail(item)),
+    );
+    target.appendChild(row);
+  });
+}
+
+function createTextBlock(tagName, className, text) {
+  const element = document.createElement(tagName);
+  if (className) element.className = className;
+  element.textContent = String(text ?? "");
+  return element;
+}
+
+function statusClass(value) {
+  const allowed = new Set(["online", "warning", "offline", "success", "running", "pending", "sent", "failed", "exited"]);
+  const normalized = String(value || "neutral").toLowerCase();
+  return allowed.has(normalized) ? normalized : "neutral";
+}
+
+function safeJson(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function showChartTooltip(event) {
+  const model = state.chartModel;
+  if (!model || !model.points.length) {
+    hideChartTooltip();
+    return;
+  }
+
+  const rect = els.chart.getBoundingClientRect();
+  const scaleX = els.chart.width / rect.width;
+  const x = (event.clientX - rect.left) * scaleX;
+  const nearest = model.points.reduce((best, item) => (
+    Math.abs(item.x - x) < Math.abs(best.x - x) ? item : best
+  ));
+
+  const point = nearest.point;
+  els.chartTooltip.replaceChildren(
+    createTextBlock("strong", "", formatBucket(point)),
+    createTextBlock("span", "", `Samples: ${point.sample_count || 0}`),
+    createTextBlock("span", "", metricTooltipLine("CPU", point.cpu_avg, point.cpu_max, point.cpu_peak_at)),
+    createTextBlock("span", "", metricTooltipLine("Memory", point.memory_avg, point.memory_max, point.memory_peak_at)),
+    createTextBlock("span", "", metricTooltipLine("Disk", point.disk_avg, point.disk_max, point.disk_peak_at)),
+  );
+  els.chartTooltip.classList.remove("is-hidden");
+  const tooltipWidth = Math.min(300, Math.max(220, rect.width - 24));
+  let left = event.clientX - rect.left + 14;
+  if (left + tooltipWidth > rect.width - 12) {
+    left = event.clientX - rect.left - tooltipWidth - 14;
+  }
+  els.chartTooltip.style.left = `${Math.max(12, left)}px`;
+  els.chartTooltip.style.top = `${Math.max(12, event.clientY - rect.top - 24)}px`;
+}
+
+function hideChartTooltip() {
+  els.chartTooltip.classList.add("is-hidden");
+}
+
+function metricTooltipLine(label, avg, max, peakAt) {
+  return `${label}: avg ${percent(avg)} / max ${percent(max)} / peak ${formatDateTime(peakAt)}`;
+}
+
+function formatBucket(point) {
+  if (state.metricRange === "1h") return formatDateTime(point.captured_at);
+  const start = formatDateTime(point.bucket_start);
+  const end = formatDateTime(point.bucket_end);
+  return `${start} - ${end}`;
+}
+
+function formatDateTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString();
+}
+
+function loadThresholds() {
+  const fallback = { cpu: 60, memory: 80, disk: 85 };
+  const raw = localStorage.getItem("monitor.thresholds");
+  if (!raw) return fallback;
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      cpu: normalizeThreshold(parsed.cpu, fallback.cpu),
+      memory: normalizeThreshold(parsed.memory, fallback.memory),
+      disk: normalizeThreshold(parsed.disk, fallback.disk),
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeThreshold(value, fallback) {
+  if (value === null) return null;
+  if (value === undefined) return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.min(100, number)) : fallback;
 }
 
 function percent(value) {
@@ -453,15 +755,6 @@ function bytes(value) {
     unit += 1;
   }
   return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unit]}`;
-}
-
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
 }
 
 let toastTimer = null;

@@ -6,12 +6,13 @@ import hmac
 import json
 import time
 
-from fastapi import HTTPException, Request, status
+from fastapi import HTTPException, Request, Response, status
 
 from .config import ServerConfig
 
 
 TOKEN_PREFIX = "monitor"
+SESSION_COOKIE_NAME = "monitor_session"
 
 
 def _b64encode(value: bytes) -> str:
@@ -86,6 +87,7 @@ def require_admin_token(request: Request) -> str:
     config: ServerConfig = request.app.state.config
     token = extract_bearer_token(request.headers.get("authorization"))
     token = token or request.headers.get("x-admin-token")
+    token = token or request.cookies.get(SESSION_COOKIE_NAME)
 
     username = verify_admin_token(config, token)
     if not username:
@@ -94,3 +96,19 @@ def require_admin_token(request: Request) -> str:
             detail="invalid or expired admin token",
         )
     return username
+
+
+def set_session_cookie(response: Response, token: str, max_age_seconds: int, secure: bool) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=max_age_seconds,
+        httponly=True,
+        secure=secure,
+        samesite="strict",
+        path="/",
+    )
+
+
+def clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(key=SESSION_COOKIE_NAME, path="/", samesite="strict")

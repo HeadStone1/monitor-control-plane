@@ -6,7 +6,7 @@ import logging
 import ssl
 import time
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 try:
     from websockets.asyncio.client import connect
@@ -56,6 +56,7 @@ class MonitorAgent:
             max_size=2_000_000,
         ) as websocket:
             LOGGER.info("connected")
+            await self._send_auth(websocket)
             await self._send(websocket, "hello", self._host_info())
 
             tasks = [
@@ -73,26 +74,28 @@ class MonitorAgent:
                 task.result()
 
     def _build_url(self) -> str:
-        parts = urlsplit(self.config.server_url)
-        query = dict(parse_qsl(parts.query))
-        query.update(
-            {
-                "token": self.config.token,
-                "agent_id": self.config.agent_id,
-                "agent_name": self.config.agent_name,
-            }
-        )
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+        return self.config.server_url
 
     def _ssl_context(self, url: str) -> ssl.SSLContext | None:
         if not url.startswith("wss://"):
             return None
         if self.config.tls_verify:
             return ssl.create_default_context()
-        return ssl._create_unverified_context()
+        raise ValueError("tls_verify=false is not allowed for wss:// connections")
 
     def _host_info(self) -> dict[str, Any]:
         return collect_host_info(self.config.agent_name, self.docker.info())
+
+    async def _send_auth(self, websocket: Any) -> None:
+        message = {
+            "type": "auth",
+            "agent_id": self.config.agent_id,
+            "agent_name": self.config.agent_name,
+            "token": self.config.token,
+            "agent_version": "0.1.0",
+            "protocol_version": "1",
+        }
+        await websocket.send(json.dumps(message, ensure_ascii=True))
 
     async def _send(self, websocket: Any, message_type: str, data: dict[str, Any]) -> None:
         self.seq += 1
@@ -170,4 +173,3 @@ class MonitorAgent:
             },
         )
         await self._send(websocket, "docker_inventory", {"containers": self.docker.inventory()})
-
