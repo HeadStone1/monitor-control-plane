@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,160 @@ def _loads(value: str | None, default: Any) -> Any:
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
+
+
+def _parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _bucket_start(value: datetime, bucket: str) -> datetime:
+    if bucket == "hour":
+        return value.replace(minute=0, second=0, microsecond=0)
+    if bucket == "day":
+        return value.replace(hour=0, minute=0, second=0, microsecond=0)
+    return value.replace(microsecond=0)
+
+
+def _average(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 2)
+
+
+def _metric_values(rows: list[dict[str, Any]], key: str) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        value = row.get(key)
+        if value is None:
+            continue
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
+def _metric_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "sample_count": len(rows),
+        "cpu": _series_summary(rows, "cpu_percent"),
+        "memory": _series_summary(rows, "memory_percent"),
+        "disk": _series_summary(rows, "disk_percent"),
+    }
+
+
+def _series_summary(rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    values = _metric_values(rows, key)
+    if not values:
+        return {"avg": None, "max": None, "peak_at": None}
+
+    peak_value = max(values)
+    peak_at = None
+    for row in rows:
+        try:
+            value = float(row.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value == peak_value:
+            peak_at = row.get("captured_at")
+            break
+
+    return {
+        "avg": _average(values),
+        "max": round(peak_value, 2),
+        "peak_at": peak_at,
+    }
+
+
+def _raw_metric_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    points: list[dict[str, Any]] = []
+    for row in rows:
+        points.append(
+            {
+                "captured_at": row.get("captured_at"),
+                "bucket_start": row.get("captured_at"),
+                "bucket_end": row.get("captured_at"),
+                "sample_count": 1,
+                **_point_metric("cpu", row.get("cpu_percent"), row.get("captured_at")),
+                **_point_metric("memory", row.get("memory_percent"), row.get("captured_at")),
+                **_point_metric("disk", row.get("disk_percent"), row.get("captured_at")),
+                "load1": row.get("load1"),
+                "load5": row.get("load5"),
+                "load15": row.get("load15"),
+                "net_rx": row.get("net_rx"),
+                "net_tx": row.get("net_tx"),
+            }
+        )
+    return points
+
+
+def _point_metric(prefix: str, value: Any, captured_at: Any) -> dict[str, Any]:
+    try:
+        number = None if value is None else round(float(value), 2)
+    except (TypeError, ValueError):
+        number = None
+    return {
+        f"{prefix}_percent": number,
+        f"{prefix}_avg": number,
+        f"{prefix}_max": number,
+        f"{prefix}_peak_at": captured_at if number is not None else None,
+    }
+
+
+def _aggregate_metric_points(rows: list[dict[str, Any]], bucket: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        captured_at = _parse_utc(str(row.get("captured_at") or ""))
+        if captured_at is None:
+            continue
+        bucket_start = _bucket_start(captured_at, bucket)
+        grouped.setdefault(bucket_start.isoformat(timespec="seconds"), []).append(row)
+
+    points: list[dict[str, Any]] = []
+    for bucket_start, bucket_rows in grouped.items():
+        points.append(
+            {
+                "captured_at": bucket_start,
+                "bucket_start": bucket_start,
+                "bucket_end": _bucket_end(bucket_start, bucket),
+                "sample_count": len(bucket_rows),
+                **_aggregate_point_metric("cpu", bucket_rows, "cpu_percent"),
+                **_aggregate_point_metric("memory", bucket_rows, "memory_percent"),
+                **_aggregate_point_metric("disk", bucket_rows, "disk_percent"),
+                "load1": _average(_metric_values(bucket_rows, "load1")),
+                "load5": _average(_metric_values(bucket_rows, "load5")),
+                "load15": _average(_metric_values(bucket_rows, "load15")),
+                "net_rx": _average(_metric_values(bucket_rows, "net_rx")),
+                "net_tx": _average(_metric_values(bucket_rows, "net_tx")),
+            }
+        )
+    return points
+
+
+def _bucket_end(bucket_start: str, bucket: str) -> str:
+    start = _parse_utc(bucket_start)
+    if start is None:
+        return bucket_start
+    delta = timedelta(hours=1) if bucket == "hour" else timedelta(days=1)
+    return (start + delta).isoformat(timespec="seconds")
+
+
+def _aggregate_point_metric(prefix: str, rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    summary = _series_summary(rows, key)
+    return {
+        f"{prefix}_percent": summary["avg"],
+        f"{prefix}_avg": summary["avg"],
+        f"{prefix}_max": summary["max"],
+        f"{prefix}_peak_at": summary["peak_at"],
+    }
 
 
 class Database:
@@ -388,6 +542,50 @@ class Database:
             ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
+    def list_metric_series(self, node_id: str, range_name: str = "1h") -> dict[str, Any]:
+        config = {
+            "1h": {"duration": timedelta(hours=1), "bucket": "raw", "limit": 1000},
+            "7d": {"duration": timedelta(days=7), "bucket": "hour", "limit": 200000},
+            "30d": {"duration": timedelta(days=30), "bucket": "day", "limit": 750000},
+        }.get(range_name)
+        if not config:
+            range_name = "1h"
+            config = {"duration": timedelta(hours=1), "bucket": "raw", "limit": 1000}
+
+        now = datetime.now(timezone.utc)
+        start = now - config["duration"]
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT *
+                FROM metrics
+                WHERE node_id = ? AND captured_at >= ?
+                ORDER BY captured_at ASC
+                LIMIT ?
+                """,
+                (node_id, start.isoformat(timespec="seconds"), config["limit"]),
+            ).fetchall()
+
+        raw_rows = [_row_to_dict(row) for row in rows]
+        parsed_rows = []
+        for row in raw_rows:
+            captured_at = _parse_utc(row.get("captured_at"))
+            if captured_at is None:
+                continue
+            row["captured_at"] = captured_at.isoformat(timespec="seconds")
+            parsed_rows.append(row)
+
+        bucket = str(config["bucket"])
+        points = _raw_metric_points(parsed_rows) if bucket == "raw" else _aggregate_metric_points(parsed_rows, bucket)
+        return {
+            "range": range_name,
+            "bucket": bucket,
+            "from": start.isoformat(timespec="seconds"),
+            "to": now.isoformat(timespec="seconds"),
+            "points": points,
+            "summary": _metric_summary(parsed_rows),
+        }
+
     def list_containers(self, node_id: str | None = None) -> list[dict[str, Any]]:
         sql = "SELECT * FROM containers"
         params: list[Any] = []
@@ -403,6 +601,14 @@ class Database:
             item["ports"] = _loads(item.pop("ports_json"), {})
             items.append(item)
         return items
+
+    def container_exists(self, node_id: str, container_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM containers WHERE node_id = ? AND container_id = ? LIMIT 1",
+                (node_id, container_id),
+            ).fetchone()
+        return row is not None
 
     def list_commands(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:

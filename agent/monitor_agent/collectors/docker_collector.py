@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 try:
@@ -122,6 +123,11 @@ class DockerCollector:
         return items
 
     def execute(self, action: str, container_id: str) -> tuple[bool, str]:
+        if action not in {"container.start", "container.stop", "container.restart"}:
+            return False, f"unsupported action: {action}"
+        if not re.fullmatch(r"[a-fA-F0-9]{12,128}", container_id):
+            return False, "invalid container id"
+
         if not self.client:
             self._connect()
         if not self.client:
@@ -138,7 +144,6 @@ class DockerCollector:
             if action == "container.restart":
                 container.restart(timeout=10)
                 return True, "container restarted"
-            return False, f"unsupported action: {action}"
         except NotFound:
             return False, "container not found"
         except DockerException as exc:

@@ -10,3 +10,6 @@ data/
 *.sqlite
 *.sqlite3
 .env
+server.yaml
+agent.yaml
+

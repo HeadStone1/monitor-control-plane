@@ -1,29 +1,33 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Monitor</title>
+    <title>Monitor Control Plane</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <section id="login-view" class="auth-screen">
       <div class="auth-card">
-        <div class="brand-mark">M</div>
-        <h1>Monitor</h1>
-        <p>登录中心控制台，查看 Linux 节点状态并管理 Docker 容器。</p>
+        <div class="brand-row">
+          <div class="brand-mark">M</div>
+          <div>
+            <h1>Monitor</h1>
+            <p>Linux and Docker control plane</p>
+          </div>
+        </div>
         <form id="login-form" class="auth-form">
           <label>
-            用户名
+            Username
             <input id="login-username" name="username" autocomplete="username" value="admin" />
           </label>
           <label>
-            密码
+            Password
             <input id="login-password" name="password" type="password" autocomplete="current-password" />
           </label>
-          <button type="submit" class="primary-button">登录</button>
+          <button type="submit" class="primary-button">Sign in</button>
         </form>
-        <div class="auth-hint">开发默认账号：admin / dev-admin-password</div>
+        <div class="auth-hint">Development account: admin / dev-admin-password</div>
       </div>
     </section>
 
@@ -46,10 +50,10 @@
 
         <div class="sidebar-footer">
           <div>
-            <span class="small-label">WebSocket</span>
+            <span class="small-label">Realtime</span>
             <strong id="ws-state">disconnected</strong>
           </div>
-          <button id="logout" type="button">退出</button>
+          <button id="logout" type="button">Sign out</button>
         </div>
       </aside>
 
@@ -57,32 +61,32 @@
         <header class="page-header">
           <div>
             <span class="eyebrow">Distributed Monitoring</span>
-            <h1>服务器监控台</h1>
+            <h1>Server Dashboard</h1>
           </div>
           <div class="header-actions">
             <span id="current-user" class="user-pill"></span>
-            <button id="refresh" type="button">刷新</button>
+            <button id="refresh" type="button">Refresh</button>
           </div>
         </header>
 
         <section id="overview" class="overview-grid">
-          <article class="stat-card">
-            <span>节点总数</span>
+          <article class="stat-card blue">
+            <span>Total Nodes</span>
             <strong id="node-count">0</strong>
             <em>registered agents</em>
           </article>
-          <article class="stat-card success">
-            <span>在线节点</span>
+          <article class="stat-card green">
+            <span>Online</span>
             <strong id="online-count">0</strong>
             <em>healthy connections</em>
           </article>
-          <article class="stat-card accent">
-            <span>容器数量</span>
+          <article class="stat-card yellow">
+            <span>Containers</span>
             <strong id="container-count">0</strong>
             <em>visible containers</em>
           </article>
-          <article class="stat-card warning">
-            <span>命令记录</span>
+          <article class="stat-card red">
+            <span>Commands</span>
             <strong id="command-count">0</strong>
             <em>recent operations</em>
           </article>
@@ -92,8 +96,8 @@
           <section class="panel node-panel">
             <div class="panel-title">
               <div>
-                <h2>节点</h2>
-                <p>Agent 心跳与主机信息</p>
+                <h2>Nodes</h2>
+                <p>Agent heartbeat and host inventory</p>
               </div>
             </div>
             <div id="nodes" class="node-list"></div>
@@ -102,10 +106,31 @@
           <section class="panel metric-panel">
             <div class="panel-title">
               <div>
-                <h2 id="selected-node-title">未选择节点</h2>
-                <p id="selected-node-meta">等待 Agent 连接</p>
+                <h2 id="selected-node-title">No node selected</h2>
+                <p id="selected-node-meta">Waiting for an agent connection</p>
               </div>
               <span id="selected-node-status" class="status-chip neutral">unknown</span>
+            </div>
+            <div class="metric-toolbar">
+              <div id="metric-range" class="segmented-control" aria-label="metric range">
+                <button type="button" data-range="1h" class="active">1h</button>
+                <button type="button" data-range="7d">7d</button>
+                <button type="button" data-range="30d">30d</button>
+              </div>
+              <div class="threshold-controls" aria-label="metric thresholds">
+                <label>
+                  CPU
+                  <input id="threshold-cpu" type="number" min="0" max="100" step="1" value="60" />
+                </label>
+                <label>
+                  Memory
+                  <input id="threshold-memory" type="number" min="0" max="100" step="1" value="80" />
+                </label>
+                <label>
+                  Disk
+                  <input id="threshold-disk" type="number" min="0" max="100" step="1" value="85" />
+                </label>
+              </div>
             </div>
             <div class="mini-metrics">
               <div><span>CPU</span><strong id="mini-cpu">-</strong></div>
@@ -113,27 +138,31 @@
               <div><span>Disk</span><strong id="mini-disk">-</strong></div>
               <div><span>Docker</span><strong id="mini-docker">-</strong></div>
             </div>
-            <canvas id="metric-chart" width="960" height="300"></canvas>
+            <div id="metric-summary" class="metric-summary"></div>
+            <div class="chart-frame">
+              <canvas id="metric-chart" width="960" height="340"></canvas>
+              <div id="chart-tooltip" class="chart-tooltip is-hidden" role="status"></div>
+            </div>
           </section>
         </section>
 
         <section id="containers" class="panel">
           <div class="panel-title">
             <div>
-              <h2>容器</h2>
-              <p>Start、Stop、Restart 命令会通过已连接的 Agent 下发</p>
+              <h2>Containers</h2>
+              <p>Start, stop, and restart commands are sent through the connected agent.</p>
             </div>
           </div>
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>名称</th>
-                  <th>镜像</th>
-                  <th>状态</th>
+                  <th>Name</th>
+                  <th>Image</th>
+                  <th>Status</th>
                   <th>CPU</th>
-                  <th>内存</th>
-                  <th>操作</th>
+                  <th>Memory</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody id="containers-table"></tbody>
@@ -145,8 +174,8 @@
           <section id="commands" class="panel">
             <div class="panel-title">
               <div>
-                <h2>命令</h2>
-                <p>最近的远程操作</p>
+                <h2>Commands</h2>
+                <p>Recent remote operations</p>
               </div>
             </div>
             <div id="commands-list" class="event-list"></div>
@@ -155,8 +184,8 @@
           <section id="audit" class="panel">
             <div class="panel-title">
               <div>
-                <h2>审计</h2>
-                <p>谁在什么时候做了什么</p>
+                <h2>Audit Logs</h2>
+                <p>Operator, action, target, and result</p>
               </div>
             </div>
             <div id="audit-list" class="event-list"></div>
