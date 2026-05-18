@@ -12,6 +12,13 @@ python -m venv .venv
 
 The command uses the Python inside `.venv`, so dependencies stay inside the project virtual environment.
 
+Generate local development hashes when replacing secrets:
+
+```powershell
+.\.venv\Scripts\python.exe -m server.monitor_server --hash-secret "your-admin-password"
+.\.venv\Scripts\python.exe -m server.monitor_server --hash-secret "your-agent-token"
+```
+
 The current MVP intentionally avoids a frontend build step. The WebUI is plain static HTML/CSS/JS served by the Python server.
 
 ## Local Config
@@ -21,7 +28,7 @@ Copy-Item server.example.yaml server.yaml
 Copy-Item agent.example.yaml agent.yaml
 ```
 
-Then replace the default passwords, tokens, and `session_secret` in both files. Keep `server.yaml` and `agent.yaml` out of Git.
+Then replace the default password hash, Agent token hash, Agent token, and `session_secret` in both files. Keep `server.yaml` and `agent.yaml` out of Git.
 
 ## Run Server
 

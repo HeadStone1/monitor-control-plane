@@ -1,20 +1,39 @@
 host: 127.0.0.1
 port: 8000
+environment: development
 allowed_hosts:
   - 127.0.0.1
   - localhost
 database_path: data/monitor.db
+secure_cookies: false
+trust_proxy_headers: false
+require_secure_transport: false
 
 # Development defaults only. Copy this file to server.yaml and replace every
 # value below before exposing the server to a network.
 admin_token: change-me-admin-token
 admin_username: admin
-admin_password: change-me-admin-password
+
+# Generate hashes with:
+# .\.venv\Scripts\python.exe -m server.monitor_server --hash-secret "your-password-or-token"
+admin_password_hash: change-me-admin-password-hash
 session_secret: change-me-random-session-secret
 session_ttl_hours: 12
 
-agent_tokens:
-  - change-me-agent-token
+agents:
+  - node_id: dev-agent
+    name: dev-agent
+    token_hash: change-me-agent-token-hash
+    enabled: true
+
+auth_rate_limit:
+  window_seconds: 60
+  login_max_failures: 8
+  ws_max_failures: 20
+
+agent_payload_limits:
+  max_containers: 1000
+  max_result_message_bytes: 4096
 
 heartbeat:
   warning_after_seconds: 30

@@ -86,12 +86,15 @@ WebUI 还支持本地设置 CPU、Memory、Disk 安全阈值，并在图表中�
 - Agent 侧再次校验动作白名单和容器 ID 格式。
 - 危险容器操作写入审计日志。
 - 真实配置文件不应提交到 Git，仓库只保留 `*.example.yaml`。
+- 管理员密码支持 `admin_password_hash`，不需要在服务端配置中保存明文密码。
+- Agent token 支持 `token_hash`，并绑定到具体 `node_id`。
+- 非本机 `ws://` Agent 连接默认被拒绝，生产模式要求安全传输和 Secure Cookie。
+- 登录和 WebSocket 认证失败有基础限速，Agent 容器清单/状态消息有数量上限。
 
 仍需加强：
 
-- 生产环境使用 HTTPS/WSS，防止中间人攻击。
-- 将单一 Agent token 改为每节点独立 token，并支持轮换/吊销。
-- 将明文管理员密码改为密码哈希，例如 Argon2id/bcrypt。
+- Agent token 轮换/吊销流程和更细粒度审计。
+- 更强密码哈希方案，例如 Argon2id/bcrypt，或对 PBKDF2 参数做可配置升级。
 - 增加 CSRF token、命令 ACK/超时、RBAC、审计查询和告警。
 - 增加依赖漏洞扫描、自动化浏览器安全测试和发布流程。
 - 为 Server/Agent 制作 systemd、Docker、升级、回滚和备份方案。
@@ -118,25 +121,38 @@ Copy-Item agent.example.yaml agent.yaml
 
 然后修改 `server.yaml`：
 
+先生成管理员密码和 Agent token 的哈希：
+
+```powershell
+.\.venv\Scripts\python.exe -m server.monitor_server --hash-secret "your-admin-password"
+.\.venv\Scripts\python.exe -m server.monitor_server --hash-secret "your-agent-token"
+```
+
+这条命令会打印 PBKDF2 哈希。把打印结果分别填入 `admin_password_hash` 和 `agents[].token_hash`。
+
 ```yaml
 allowed_hosts:
   - 127.0.0.1
   - localhost
 admin_token: replace-with-long-random-value
 admin_username: admin
-admin_password: replace-with-strong-password
+admin_password_hash: replace-with-generated-admin-password-hash
 session_secret: replace-with-long-random-secret
-agent_tokens:
-  - replace-with-long-random-agent-token
+agents:
+  - node_id: dev-agent
+    name: dev-agent
+    token_hash: replace-with-generated-agent-token-hash
+    enabled: true
 ```
 
-再修改 `agent.yaml`，让 `token` 与 `server.yaml` 里的 Agent token 一致：
+再修改 `agent.yaml`，让 `token` 与生成 `token_hash` 时输入的明文 Agent token 一致：
 
 ```yaml
 server_url: ws://127.0.0.1:8000/agent/ws
 agent_id: dev-agent
 agent_name: dev-agent
 token: replace-with-long-random-agent-token
+allow_insecure_transport: false
 ```
 
 启动 Server：
@@ -166,6 +182,7 @@ Server 支持用环境变量覆盖敏感配置：
 ```text
 MONITOR_ADMIN_TOKEN
 MONITOR_ADMIN_USERNAME
+MONITOR_ADMIN_PASSWORD_HASH
 MONITOR_ADMIN_PASSWORD
 MONITOR_SESSION_SECRET
 MONITOR_SESSION_TTL_HOURS
@@ -174,9 +191,13 @@ MONITOR_ALLOWED_HOSTS
 MONITOR_DATABASE_PATH
 MONITOR_HOST
 MONITOR_PORT
+MONITOR_ENV
+MONITOR_SECURE_COOKIES
+MONITOR_TRUST_PROXY_HEADERS
+MONITOR_REQUIRE_SECURE_TRANSPORT
 ```
 
-`MONITOR_AGENT_TOKENS` 和 `MONITOR_ALLOWED_HOSTS` 支持逗号分隔：
+`MONITOR_AGENT_TOKENS` 是兼容旧配置的开发回退方式，会绑定到 `dev-agent` / `legacy-agent-*`；生产环境应使用 `agents[].token_hash`。`MONITOR_ALLOWED_HOSTS` 支持逗号分隔：
 
 ```text
 token-a,token-b,token-c
@@ -202,3 +223,35 @@ This project is source-available under the Monitor Personal Use License v0.1.
 - This is not an OSI open source license.
 
 See [LICENSE](LICENSE) for details.
+
+## Security Hardening Update
+
+The current security baseline is stricter than the initial MVP:
+
+- Admin login supports `admin_password_hash`; generate it with `python -m server.monitor_server --hash-secret "your-password"`.
+- Plaintext `admin_password` is kept only as a local-development fallback and is refused in production or non-loopback binds.
+- Agent credentials are bound to specific node IDs through the `agents` config list.
+- A leaked token for one Agent can no longer claim an arbitrary `agent_id`.
+- Agent token hashes are supported through `token_hash`; plaintext Agent tokens are only accepted as a local-development fallback.
+- Production mode requires `secure_cookies: true` and `require_secure_transport: true`.
+- Non-loopback Agent `ws://` connections are blocked unless explicitly opted in with `allow_insecure_transport: true`.
+- Login and WebSocket authentication failures are rate limited.
+- Agent inventory/stat payloads are capped to reduce resource-exhaustion risk.
+
+Recommended production server config shape:
+
+```yaml
+environment: production
+host: 127.0.0.1
+secure_cookies: true
+trust_proxy_headers: true
+require_secure_transport: true
+admin_username: admin
+admin_password_hash: replace-with-generated-hash
+session_secret: replace-with-long-random-secret
+agents:
+  - node_id: prod-linux-01
+    name: prod-linux-01
+    token_hash: replace-with-generated-agent-token-hash
+    enabled: true
+```

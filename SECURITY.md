@@ -83,3 +83,13 @@ Risk reduction:
 ## Disclosure
 
 For private security reports, contact the repository owner. Do not publish exploit details before the maintainer has had time to investigate.
+
+## Implemented Hardening After Audit
+
+- Admin passwords can now be stored as PBKDF2 hashes with `admin_password_hash`.
+- Agent tokens can now be stored as PBKDF2 hashes with per-node `agents[].token_hash`.
+- Agent authentication now binds a token to a specific `node_id`; a token for one node cannot claim another node.
+- Production mode refuses plaintext admin passwords, plaintext Agent tokens, development defaults, insecure cookies, and missing secure-transport enforcement.
+- Login and WebSocket authentication failures are rate limited.
+- Agent container inventory and command result messages are capped to reduce resource exhaustion.
+- Non-loopback Agent `ws://` connections are blocked unless explicitly allowed by configuration.
