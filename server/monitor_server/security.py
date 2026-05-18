@@ -4,15 +4,18 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 import time
 
 from fastapi import HTTPException, Request, Response, status
 
-from .config import ServerConfig
+from .config import AgentCredential, ServerConfig
 
 
 TOKEN_PREFIX = "monitor"
 SESSION_COOKIE_NAME = "monitor_session"
+SECRET_HASH_PREFIX = "pbkdf2_sha256"
+DEFAULT_SECRET_HASH_ITERATIONS = 310_000
 
 
 def _b64encode(value: bytes) -> str:
@@ -22,6 +25,40 @@ def _b64encode(value: bytes) -> str:
 def _b64decode(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode(value + padding)
+
+
+def hash_secret(secret: str, *, iterations: int = DEFAULT_SECRET_HASH_ITERATIONS) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, iterations)
+    return f"{SECRET_HASH_PREFIX}${iterations}${_b64encode(salt)}${_b64encode(digest)}"
+
+
+def is_secret_hash(encoded: str) -> bool:
+    parts = encoded.split("$")
+    if len(parts) != 4 or parts[0] != SECRET_HASH_PREFIX:
+        return False
+    try:
+        int(parts[1])
+        _b64decode(parts[2])
+        _b64decode(parts[3])
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def verify_secret(secret: str, encoded: str) -> bool:
+    if not is_secret_hash(encoded):
+        return False
+    parts = encoded.split("$")
+    try:
+        iterations = int(parts[1])
+        salt = _b64decode(parts[2])
+        expected = _b64decode(parts[3])
+    except (ValueError, TypeError):
+        return False
+
+    digest = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(digest, expected)
 
 
 def extract_bearer_token(value: str | None) -> str | None:
@@ -42,6 +79,30 @@ def create_session_token(config: ServerConfig, username: str) -> tuple[str, int]
     body = _b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     signature = _sign(config, body)
     return f"{TOKEN_PREFIX}.{body}.{signature}", expires_at
+
+
+def verify_admin_password(config: ServerConfig, username: str, password: str) -> bool:
+    if not hmac.compare_digest(username, config.admin_username):
+        return False
+    if config.admin_password_hash:
+        return verify_secret(password, config.admin_password_hash)
+    if config.admin_password:
+        return hmac.compare_digest(password, config.admin_password)
+    return False
+
+
+def verify_agent_credentials(config: ServerConfig, node_id: str, token: str) -> AgentCredential | None:
+    if not node_id or not token:
+        return None
+
+    for agent in config.agents:
+        if not agent.enabled or not hmac.compare_digest(node_id, agent.node_id):
+            continue
+        if agent.token_hash and verify_secret(token, agent.token_hash):
+            return agent
+        if agent.token and hmac.compare_digest(token, agent.token):
+            return agent
+    return None
 
 
 def verify_admin_token(config: ServerConfig, token: str | None) -> str | None:

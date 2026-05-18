@@ -77,7 +77,12 @@ class MonitorAgent:
         return self.config.server_url
 
     def _ssl_context(self, url: str) -> ssl.SSLContext | None:
-        if not url.startswith("wss://"):
+        parts = urlsplit(url)
+        if parts.scheme == "ws":
+            if self.config.allow_insecure_transport or _is_loopback_host(parts.hostname or ""):
+                return None
+            raise ValueError("ws:// is only allowed for loopback hosts unless allow_insecure_transport=true")
+        if parts.scheme != "wss":
             return None
         if self.config.tls_verify:
             return ssl.create_default_context()
@@ -173,3 +178,7 @@ class MonitorAgent:
             },
         )
         await self._send(websocket, "docker_inventory", {"containers": self.docker.inventory()})
+
+
+def _is_loopback_host(host: str) -> bool:
+    return host in {"127.0.0.1", "localhost", "::1"}

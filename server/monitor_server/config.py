@@ -8,6 +8,16 @@ from typing import Any
 import yaml
 
 
+DEV_ADMIN_PASSWORD_HASH = (
+    "pbkdf2_sha256$310000$bW9uaXRvci1kZXYtYWRtaW4tc2FsdA$"
+    "-82Brrs8OuexgSIZ36iHB783tRwRnYOKUUwHR3QBp5A"
+)
+DEV_AGENT_TOKEN_HASH = (
+    "pbkdf2_sha256$310000$bW9uaXRvci1kZXYtYWdlbnQtc2FsdA$"
+    "F4pWYJLeR4YG4mBmyS6HP-3wRV3syvJU0QBSkREPCxM"
+)
+
+
 @dataclass(slots=True)
 class HeartbeatConfig:
     warning_after_seconds: int = 30
@@ -15,17 +25,54 @@ class HeartbeatConfig:
 
 
 @dataclass(slots=True)
+class AgentCredential:
+    node_id: str
+    name: str
+    token_hash: str = ""
+    token: str = ""
+    enabled: bool = True
+
+
+@dataclass(slots=True)
+class AuthRateLimitConfig:
+    window_seconds: int = 60
+    login_max_failures: int = 8
+    ws_max_failures: int = 20
+
+
+@dataclass(slots=True)
+class AgentPayloadLimitConfig:
+    max_containers: int = 1000
+    max_result_message_bytes: int = 4096
+
+
+@dataclass(slots=True)
 class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8000
+    environment: str = "development"
     allowed_hosts: list[str] = field(default_factory=lambda: ["127.0.0.1", "localhost"])
     database_path: Path = Path("data/monitor.db")
     admin_token: str = "dev-admin-token"
     admin_username: str = "admin"
-    admin_password: str = "dev-admin-password"
+    admin_password_hash: str = DEV_ADMIN_PASSWORD_HASH
+    admin_password: str = ""
     session_secret: str = "dev-session-secret-change-me"
     session_ttl_hours: int = 12
-    agent_tokens: list[str] = field(default_factory=lambda: ["dev-agent-token"])
+    secure_cookies: bool = False
+    trust_proxy_headers: bool = False
+    require_secure_transport: bool = False
+    agents: list[AgentCredential] = field(
+        default_factory=lambda: [
+            AgentCredential(
+                node_id="dev-agent",
+                name="dev-agent",
+                token_hash=DEV_AGENT_TOKEN_HASH,
+            )
+        ]
+    )
+    auth_rate_limit: AuthRateLimitConfig = field(default_factory=AuthRateLimitConfig)
+    agent_payload_limits: AgentPayloadLimitConfig = field(default_factory=AgentPayloadLimitConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 
 
@@ -41,11 +88,60 @@ def _env(name: str, fallback: Any) -> Any:
     return fallback if value is None or value == "" else value
 
 
+def _env_bool(name: str, fallback: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return fallback
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _env_list(name: str, fallback: list[str]) -> list[str]:
     value = os.getenv(name)
     if value is None or value.strip() == "":
         return fallback
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _load_agents(raw: dict[str, Any]) -> list[AgentCredential]:
+    agents_raw = raw.get("agents")
+    if isinstance(agents_raw, list) and agents_raw:
+        agents: list[AgentCredential] = []
+        for item in agents_raw:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("node_id") or item.get("agent_id") or "").strip()
+            if not node_id:
+                continue
+            agents.append(
+                AgentCredential(
+                    node_id=node_id,
+                    name=str(item.get("name") or item.get("agent_name") or node_id),
+                    token_hash=str(item.get("token_hash") or ""),
+                    token=str(item.get("token") or ""),
+                    enabled=bool(item.get("enabled", True)),
+                )
+            )
+        if agents:
+            return agents
+
+    legacy_tokens = [str(item) for item in raw.get("agent_tokens", []) if str(item)]
+    if legacy_tokens:
+        return [
+            AgentCredential(
+                node_id="dev-agent" if index == 0 else f"legacy-agent-{index + 1}",
+                name="dev-agent" if index == 0 else f"legacy-agent-{index + 1}",
+                token=token,
+            )
+            for index, token in enumerate(legacy_tokens)
+        ]
+
+    return [
+        AgentCredential(
+            node_id="dev-agent",
+            name="dev-agent",
+            token_hash=DEV_AGENT_TOKEN_HASH,
+        )
+    ]
 
 
 def load_server_config(path: str | None) -> ServerConfig:
@@ -57,12 +153,21 @@ def load_server_config(path: str | None) -> ServerConfig:
         with config_path.open("r", encoding="utf-8") as file:
             raw = yaml.safe_load(file) or {}
 
+    env_agent_tokens = os.getenv("MONITOR_AGENT_TOKENS")
+    if env_agent_tokens and "agents" not in raw:
+        raw["agent_tokens"] = [item.strip() for item in env_agent_tokens.split(",") if item.strip()]
+
     heartbeat_raw = raw.get("heartbeat") or {}
-    agent_tokens = [str(item) for item in raw.get("agent_tokens", ["dev-agent-token"])]
+    rate_limit_raw = raw.get("auth_rate_limit") or {}
+    payload_limit_raw = raw.get("agent_payload_limits") or {}
+    admin_password_hash_default = raw.get("admin_password_hash")
+    if admin_password_hash_default is None:
+        admin_password_hash_default = "" if ("admin_password" in raw or os.getenv("MONITOR_ADMIN_PASSWORD")) else DEV_ADMIN_PASSWORD_HASH
     allowed_hosts = [str(item) for item in raw.get("allowed_hosts", ["127.0.0.1", "localhost"])]
     return ServerConfig(
         host=str(_env("MONITOR_HOST", raw.get("host", "127.0.0.1"))),
         port=int(_env("MONITOR_PORT", raw.get("port", 8000))),
+        environment=str(_env("MONITOR_ENV", raw.get("environment", "development"))),
         allowed_hosts=_env_list("MONITOR_ALLOWED_HOSTS", allowed_hosts),
         database_path=_resolve_path(
             _env("MONITOR_DATABASE_PATH", raw.get("database_path", "data/monitor.db")),
@@ -70,10 +175,26 @@ def load_server_config(path: str | None) -> ServerConfig:
         ),
         admin_token=str(_env("MONITOR_ADMIN_TOKEN", raw.get("admin_token", "dev-admin-token"))),
         admin_username=str(_env("MONITOR_ADMIN_USERNAME", raw.get("admin_username", "admin"))),
-        admin_password=str(_env("MONITOR_ADMIN_PASSWORD", raw.get("admin_password", "dev-admin-password"))),
+        admin_password_hash=str(_env("MONITOR_ADMIN_PASSWORD_HASH", admin_password_hash_default)),
+        admin_password=str(_env("MONITOR_ADMIN_PASSWORD", raw.get("admin_password", ""))),
         session_secret=str(_env("MONITOR_SESSION_SECRET", raw.get("session_secret", "dev-session-secret-change-me"))),
         session_ttl_hours=int(_env("MONITOR_SESSION_TTL_HOURS", raw.get("session_ttl_hours", 12))),
-        agent_tokens=_env_list("MONITOR_AGENT_TOKENS", agent_tokens),
+        secure_cookies=_env_bool("MONITOR_SECURE_COOKIES", bool(raw.get("secure_cookies", False))),
+        trust_proxy_headers=_env_bool("MONITOR_TRUST_PROXY_HEADERS", bool(raw.get("trust_proxy_headers", False))),
+        require_secure_transport=_env_bool(
+            "MONITOR_REQUIRE_SECURE_TRANSPORT",
+            bool(raw.get("require_secure_transport", False)),
+        ),
+        agents=_load_agents(raw),
+        auth_rate_limit=AuthRateLimitConfig(
+            window_seconds=int(rate_limit_raw.get("window_seconds", 60)),
+            login_max_failures=int(rate_limit_raw.get("login_max_failures", 8)),
+            ws_max_failures=int(rate_limit_raw.get("ws_max_failures", 20)),
+        ),
+        agent_payload_limits=AgentPayloadLimitConfig(
+            max_containers=int(payload_limit_raw.get("max_containers", 1000)),
+            max_result_message_bytes=int(payload_limit_raw.get("max_result_message_bytes", 4096)),
+        ),
         heartbeat=HeartbeatConfig(
             warning_after_seconds=int(heartbeat_raw.get("warning_after_seconds", 30)),
             offline_after_seconds=int(heartbeat_raw.get("offline_after_seconds", 60)),

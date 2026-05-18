@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-05-18
+
+### Security
+
+- Added PBKDF2 password hashing support through `admin_password_hash`.
+- Added per-node Agent credentials through `agents[].node_id` and `agents[].token_hash`.
+- Changed Agent authentication so a valid token can only claim its configured node ID.
+- Added production startup checks that refuse development defaults, plaintext secrets, insecure cookies, and missing secure-transport enforcement.
+- Added login and WebSocket authentication failure rate limiting.
+- Added Agent payload limits for container inventory/stat messages and command result text.
+- Added Agent-side guard against non-loopback `ws://` connections unless explicitly allowed.
+- Added `--hash-secret` helper for generating admin password and Agent token hashes.
+
 ## 2026-05-17
 
 ### Added

@@ -3,6 +3,7 @@ agent_id: dev-agent
 agent_name: dev-agent
 token: change-me-agent-token
 tls_verify: true
+allow_insecure_transport: false
 
 intervals:
   heartbeat: 10
@@ -13,4 +14,3 @@ intervals:
 
 docker:
   enabled: true
-

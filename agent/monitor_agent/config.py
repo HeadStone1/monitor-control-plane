@@ -28,6 +28,7 @@ class AgentConfig:
     agent_name: str = "dev-agent"
     token: str = "dev-agent-token"
     tls_verify: bool = True
+    allow_insecure_transport: bool = False
     intervals: IntervalConfig = field(default_factory=IntervalConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
 
@@ -49,6 +50,7 @@ def load_agent_config(path: str | None) -> AgentConfig:
         agent_name=str(raw.get("agent_name", agent_id)),
         token=str(raw.get("token", "dev-agent-token")),
         tls_verify=bool(raw.get("tls_verify", True)),
+        allow_insecure_transport=bool(raw.get("allow_insecure_transport", False)),
         intervals=IntervalConfig(
             heartbeat=int(intervals_raw.get("heartbeat", 10)),
             metrics=int(intervals_raw.get("metrics", 5)),
