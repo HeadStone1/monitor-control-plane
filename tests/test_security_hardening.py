@@ -6,9 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from server.monitor_server.app import _handle_agent_message, create_app
-from server.monitor_server.config import AgentCredential, ServerConfig
+from server.monitor_server.config import AgentCredential, ApiTokenConfig, ServerConfig
 from server.monitor_server.db import Database
 from server.monitor_server.hub import ConnectionHub
 from server.monitor_server.security import hash_secret
@@ -133,3 +134,29 @@ def test_stale_commands_timeout(tmp_path: Path) -> None:
 
     assert len(expired) == 1
     assert expired[0]["status"] == "timeout"
+
+
+def test_frontend_logout_preserves_csrf_for_request() -> None:
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    assert "const csrfToken = state.csrfToken;" in script
+    assert 'headers: csrfHeaders("POST", csrfToken),' in script
+
+
+def test_ui_websocket_rejects_api_token(tmp_path: Path) -> None:
+    cfg = config(
+        tmp_path,
+        api_tokens=[
+            ApiTokenConfig(
+                name="read-token",
+                token_hash=hash_secret("api-token"),
+                scopes=["nodes:read"],
+            )
+        ],
+    )
+    app = create_app(cfg)
+
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws/ui") as websocket:
+                websocket.send_json({"type": "auth", "token": "api-token"})
+                websocket.receive_json()

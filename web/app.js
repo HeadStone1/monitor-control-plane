@@ -108,6 +108,7 @@ async function login(event) {
 }
 
 function logout(showMessage = true) {
+  const csrfToken = state.csrfToken;
   if (state.ws) {
     state.ws.close();
   }
@@ -124,7 +125,7 @@ function logout(showMessage = true) {
   fetch("/api/auth/logout", {
     method: "POST",
     credentials: "same-origin",
-    headers: csrfHeaders("POST"),
+    headers: csrfHeaders("POST", csrfToken),
   }).catch(() => {});
   localStorage.removeItem("monitor.sessionToken");
   localStorage.removeItem("monitor.username");
@@ -163,12 +164,12 @@ async function api(path, options = {}) {
   return response.json();
 }
 
-function csrfHeaders(method = "GET") {
+function csrfHeaders(method = "GET", token = state.csrfToken) {
   const normalized = String(method || "GET").toUpperCase();
-  if (!["POST", "PUT", "PATCH", "DELETE"].includes(normalized) || !state.csrfToken) {
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(normalized) || !token) {
     return {};
   }
-  return { "X-CSRF-Token": state.csrfToken };
+  return { "X-CSRF-Token": token };
 }
 
 function connectWs() {

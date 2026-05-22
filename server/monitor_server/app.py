@@ -22,13 +22,12 @@ from .security import (
     clear_session_cookie,
     create_session_token,
     extract_csrf_token,
-    require_admin_token,
     require_permission,
     set_session_cookie,
     is_secret_hash,
-    verify_admin_token,
     verify_admin_password,
     verify_agent_credentials,
+    verify_auth_context,
 )
 
 
@@ -438,7 +437,12 @@ def create_app(config: ServerConfig) -> FastAPI:
 
         auth = await _receive_ws_auth(websocket)
         token = str((auth or {}).get("token") or "") or websocket.cookies.get(SESSION_COOKIE_NAME)
-        if not verify_admin_token(config, token):
+        context = verify_auth_context(config, token, allow_static_admin_token=True)
+        if (
+            not context
+            or context.source != "session"
+            or ("*" not in context.scopes and "nodes:read" not in context.scopes)
+        ):
             limiter.add_failure(rate_key)
             app.state.db.add_security_event(
                 event_type="ui_ws_auth_failed",
