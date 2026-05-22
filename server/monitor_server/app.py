@@ -93,6 +93,13 @@ class CommandResultPayload(BaseModel):
     message: str | None = Field(default=None, max_length=4096)
 
 
+class LoginPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=4096)
+
+
 class FailureRateLimiter:
     def __init__(self, window_seconds: int, max_failures: int) -> None:
         self.window_seconds = max(1, window_seconds)
@@ -197,9 +204,20 @@ def create_app(config: ServerConfig) -> FastAPI:
 
     @app.post("/api/auth/login")
     async def login(request: Request, response: Response) -> dict[str, Any]:
-        body = await request.json()
-        username = str(body.get("username") or "")
-        password = str(body.get("password") or "")
+        try:
+            body = await request.json()
+            login_payload = LoginPayload.model_validate(body)
+        except (ValueError, ValidationError):
+            app.state.db.add_security_event(
+                event_type="login_invalid_payload",
+                client_ip=_client_host(request),
+                user_agent=request.headers.get("user-agent"),
+                result="rejected",
+            )
+            raise HTTPException(status_code=400, detail="invalid login payload")
+
+        username = login_payload.username
+        password = login_payload.password
         limiter: FailureRateLimiter = app.state.login_limiter
         rate_key = f"login:{_client_host(request)}:{username}"
 

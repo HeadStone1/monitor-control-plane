@@ -160,3 +160,18 @@ def test_ui_websocket_rejects_api_token(tmp_path: Path) -> None:
             with client.websocket_connect("/ws/ui") as websocket:
                 websocket.send_json({"type": "auth", "token": "api-token"})
                 websocket.receive_json()
+
+
+def test_login_rejects_invalid_payload_shape(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    app = create_app(cfg)
+
+    with TestClient(app) as client:
+        response = client.post("/api/auth/login", json=["admin", "admin-password"])
+        assert response.status_code == 400
+
+        response = client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "x" * 5000},
+        )
+        assert response.status_code == 400
