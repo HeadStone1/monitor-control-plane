@@ -25,7 +25,10 @@ class MonitorAgent:
     def __init__(self, config: AgentConfig) -> None:
         self.config = config
         self.system = SystemCollector()
-        self.docker = DockerCollector(enabled=config.docker.enabled)
+        self.docker = DockerCollector(
+            enabled=config.docker.enabled,
+            allowed_labels=config.docker.allowed_labels,
+        )
         self.seq = 0
         self._send_lock = asyncio.Lock()
 

@@ -1,5 +1,6 @@
 const state = {
   username: "",
+  csrfToken: "",
   nodes: [],
   containers: [],
   commands: [],
@@ -69,6 +70,7 @@ async function boot() {
   try {
     const profile = await api("/api/auth/me");
     state.username = profile.username;
+    state.csrfToken = profile.csrf_token || "";
     showApp();
     connectWs();
     await refreshAll();
@@ -95,6 +97,7 @@ async function login(event) {
     }
     const data = await response.json();
     state.username = data.username;
+    state.csrfToken = data.csrf_token || "";
     showApp();
     connectWs();
     await refreshAll();
@@ -110,6 +113,7 @@ function logout(showMessage = true) {
   }
   clearInterval(state.refreshTimer);
   state.username = "";
+  state.csrfToken = "";
   state.nodes = [];
   state.containers = [];
   state.commands = [];
@@ -117,7 +121,11 @@ function logout(showMessage = true) {
   state.metrics = [];
   state.metricPayload = null;
   state.chartModel = null;
-  fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
+  fetch("/api/auth/logout", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: csrfHeaders("POST"),
+  }).catch(() => {});
   localStorage.removeItem("monitor.sessionToken");
   localStorage.removeItem("monitor.username");
   showLogin();
@@ -141,6 +149,7 @@ async function api(path, options = {}) {
     credentials: "same-origin",
     headers: {
       "Content-Type": "application/json",
+      ...csrfHeaders(options.method),
       ...(options.headers || {}),
     },
   });
@@ -152,6 +161,14 @@ async function api(path, options = {}) {
     throw new Error(`${response.status} ${response.statusText}`);
   }
   return response.json();
+}
+
+function csrfHeaders(method = "GET") {
+  const normalized = String(method || "GET").toUpperCase();
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(normalized) || !state.csrfToken) {
+    return {};
+  }
+  return { "X-CSRF-Token": state.csrfToken };
 }
 
 function connectWs() {

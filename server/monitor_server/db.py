@@ -266,10 +266,28 @@ class Database:
                     target TEXT,
                     node_id TEXT,
                     result TEXT,
+                    event_type TEXT,
+                    actor TEXT,
+                    client_ip TEXT,
+                    user_agent TEXT,
+                    detail_json TEXT,
                     created_at TEXT NOT NULL
                 );
                 """
             )
+            self._ensure_column("audit_logs", "event_type", "TEXT")
+            self._ensure_column("audit_logs", "actor", "TEXT")
+            self._ensure_column("audit_logs", "client_ip", "TEXT")
+            self._ensure_column("audit_logs", "user_agent", "TEXT")
+            self._ensure_column("audit_logs", "detail_json", "TEXT")
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        existing = {
+            row["name"]
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in existing:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def close(self) -> None:
         with self._lock:
@@ -464,17 +482,25 @@ class Database:
                 (now, now, command_id),
             )
 
-    def mark_command_result(self, command_id: str, status: str, message: str | None) -> dict[str, Any] | None:
+    def mark_command_result(
+        self,
+        command_id: str,
+        node_id: str,
+        status: str,
+        message: str | None,
+    ) -> dict[str, Any] | None:
         now = utc_now()
         with self._lock, self._conn:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 """
                 UPDATE commands
                 SET status = ?, result_message = ?, finished_at = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND node_id = ?
                 """,
-                (status, message, now, now, command_id),
+                (status, message, now, now, command_id, node_id),
             )
+            if cursor.rowcount == 0:
+                return None
         return self.get_command(command_id)
 
     def get_command(self, command_id: str) -> dict[str, Any] | None:
@@ -497,10 +523,49 @@ class Database:
         with self._lock, self._conn:
             self._conn.execute(
                 """
-                INSERT INTO audit_logs (user, action, target, node_id, result, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO audit_logs (
+                    user, action, target, node_id, result,
+                    event_type, actor, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user, action, target, node_id, result, utc_now()),
+                (user, action, target, node_id, result, action, user, utc_now()),
+            )
+
+    def add_security_event(
+        self,
+        event_type: str,
+        actor: str | None = None,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
+        node_id: str | None = None,
+        target: str | None = None,
+        result: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        detail_json = json.dumps(detail or {}, ensure_ascii=True, default=str)
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO audit_logs (
+                    user, action, target, node_id, result,
+                    event_type, actor, client_ip, user_agent, detail_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    actor or "system",
+                    event_type,
+                    target,
+                    node_id,
+                    result,
+                    event_type,
+                    actor,
+                    client_ip,
+                    user_agent,
+                    detail_json,
+                    utc_now(),
+                ),
             )
 
     def list_nodes(self) -> list[dict[str, Any]]:
@@ -657,3 +722,42 @@ class Database:
                     )
                     changed.append({"node_id": row["id"], "status": next_status})
         return changed
+
+    def expire_stale_commands(self, timeout_seconds: int) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=max(0, timeout_seconds))
+        expired_ids: list[str] = []
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                """
+                SELECT id FROM commands
+                WHERE status IN ('pending', 'sent') AND created_at <= ?
+                """,
+                (cutoff.isoformat(timespec="seconds"),),
+            ).fetchall()
+            expired_ids = [row["id"] for row in rows]
+            if expired_ids:
+                placeholders = ",".join("?" for _ in expired_ids)
+                self._conn.execute(
+                    f"""
+                    UPDATE commands
+                    SET status = 'timeout',
+                        result_message = 'agent did not acknowledge in time',
+                        finished_at = ?,
+                        updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    [utc_now(), utc_now(), *expired_ids],
+                )
+        return [command for command_id in expired_ids if (command := self.get_command(command_id))]
+
+    def prune_metrics(self, raw_metrics_days: int) -> int:
+        if raw_metrics_days <= 0:
+            return 0
+        cutoff = datetime.now(timezone.utc) - timedelta(days=raw_metrics_days)
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM metrics WHERE captured_at < ?",
+                (cutoff.isoformat(timespec="seconds"),),
+            )
+            return int(cursor.rowcount or 0)

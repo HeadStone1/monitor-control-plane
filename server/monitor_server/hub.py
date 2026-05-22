@@ -12,9 +12,12 @@ class ConnectionHub:
         self._ui_clients: set[WebSocket] = set()
         self._lock = asyncio.Lock()
 
-    async def register_agent(self, node_id: str, websocket: WebSocket) -> None:
+    async def register_agent(self, node_id: str, websocket: WebSocket) -> bool:
         async with self._lock:
+            if node_id in self._agents:
+                return False
             self._agents[node_id] = websocket
+            return True
 
     async def unregister_agent(self, node_id: str, websocket: WebSocket) -> None:
         async with self._lock:
@@ -65,4 +68,3 @@ class ConnectionHub:
             async with self._lock:
                 for websocket in stale:
                     self._ui_clients.discard(websocket)
-

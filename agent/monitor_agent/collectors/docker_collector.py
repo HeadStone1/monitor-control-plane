@@ -13,8 +13,9 @@ except ImportError:  # pragma: no cover
 
 
 class DockerCollector:
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(self, enabled: bool = True, allowed_labels: dict[str, str] | None = None) -> None:
         self.enabled = enabled
+        self.allowed_labels = allowed_labels or {"monitor.control-plane.allow": "true"}
         self.client: Any | None = None
         self.error: str | None = None
         self._connect()
@@ -135,6 +136,8 @@ class DockerCollector:
 
         try:
             container = self.client.containers.get(container_id)
+            if not self._is_control_allowed(container):
+                return False, "container is not labeled for monitor control-plane actions"
             if action == "container.start":
                 container.start()
                 return True, "container started"
@@ -148,6 +151,14 @@ class DockerCollector:
             return False, "container not found"
         except DockerException as exc:
             return False, str(exc)
+
+    def _is_control_allowed(self, container: Any) -> bool:
+        if not self.allowed_labels:
+            return False
+        attrs = container.attrs or {}
+        config = attrs.get("Config") or {}
+        labels = config.get("Labels") or {}
+        return all(str(labels.get(key)) == str(value) for key, value in self.allowed_labels.items())
 
 
 def _calculate_cpu_percent(stats: dict[str, Any]) -> float:

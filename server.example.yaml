@@ -20,9 +20,42 @@ admin_password_hash: change-me-admin-password-hash
 session_secret: change-me-random-session-secret
 session_ttl_hours: 12
 
+users:
+  - username: admin
+    password_hash: change-me-admin-password-hash
+    role: admin
+    enabled: true
+
+roles:
+  viewer:
+    - nodes:read
+    - containers:read
+    - metrics:read
+    - commands:read
+    - audit:read
+  operator:
+    - nodes:read
+    - containers:read
+    - metrics:read
+    - commands:read
+    - commands:create
+    - audit:read
+  admin:
+    - "*"
+
+api_tokens:
+  - name: automation-token-1
+    token_hash: change-me-api-token-hash
+    scopes:
+      - nodes:read
+      - containers:read
+    expires_at: 2026-12-31T00:00:00Z
+    enabled: false
+
 agents:
   - node_id: dev-agent
     name: dev-agent
+    token_id: token-2026-05
     token_hash: change-me-agent-token-hash
     enabled: true
 
@@ -34,6 +67,14 @@ auth_rate_limit:
 agent_payload_limits:
   max_containers: 1000
   max_result_message_bytes: 4096
+  max_string_length: 256
+  max_ports_entries: 64
+
+command:
+  timeout_seconds: 60
+
+retention:
+  raw_metrics_days: 7
 
 heartbeat:
   warning_after_seconds: 30

@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse
@@ -16,10 +17,13 @@ from .config import DEV_ADMIN_PASSWORD_HASH, DEV_AGENT_TOKEN_HASH, ServerConfig
 from .db import Database
 from .hub import ConnectionHub
 from .security import (
+    AuthContext,
     SESSION_COOKIE_NAME,
     clear_session_cookie,
     create_session_token,
+    extract_csrf_token,
     require_admin_token,
+    require_permission,
     set_session_cookie,
     is_secret_hash,
     verify_admin_token,
@@ -35,6 +39,59 @@ ALLOWED_COMMANDS = {
 }
 
 LOGGER = logging.getLogger("monitor.server")
+MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+class MetricsPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    captured_at: str | None = Field(default=None, max_length=64)
+    cpu_percent: float | None = Field(default=None, ge=0, le=100)
+    memory_percent: float | None = Field(default=None, ge=0, le=100)
+    disk_percent: float | None = Field(default=None, ge=0, le=100)
+    load1: float | None = Field(default=None, ge=0)
+    load5: float | None = Field(default=None, ge=0)
+    load15: float | None = Field(default=None, ge=0)
+    net_rx: int | None = Field(default=None, ge=0)
+    net_tx: int | None = Field(default=None, ge=0)
+
+
+class DockerContainerPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(pattern=r"^[a-fA-F0-9]{12,128}$")
+    short_id: str | None = Field(default=None, max_length=128)
+    name: str | None = Field(default=None, max_length=128)
+    image: str | None = Field(default=None, max_length=256)
+    status: str | None = Field(default=None, max_length=64)
+    ports: dict[str, Any] = Field(default_factory=dict)
+    cpu_percent: float | None = Field(default=None, ge=0, le=100)
+    memory_usage: int | None = Field(default=None, ge=0)
+    memory_limit: int | None = Field(default=None, ge=0)
+
+    @field_validator("ports")
+    @classmethod
+    def validate_ports(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if len(value) > 64:
+            raise ValueError("too many ports")
+        return value
+
+
+class DockerStatsPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(pattern=r"^[a-fA-F0-9]{12,128}$")
+    cpu_percent: float | None = Field(default=None, ge=0, le=100)
+    memory_usage: int | None = Field(default=None, ge=0)
+    memory_limit: int | None = Field(default=None, ge=0)
+
+
+class CommandResultPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    command_id: str = Field(min_length=1, max_length=80)
+    status: str = Field(pattern=r"^(success|failed)$")
+    message: str | None = Field(default=None, max_length=4096)
 
 
 class FailureRateLimiter:
@@ -73,7 +130,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "script-src 'self'; "
             "style-src 'self'; "
             "img-src 'self' data:; "
-            "connect-src 'self' ws: wss:; "
+            "connect-src 'self'; "
             "object-src 'none'; "
             "base-uri 'self'; "
             "frame-ancestors 'none'; "
@@ -148,43 +205,67 @@ def create_app(config: ServerConfig) -> FastAPI:
         rate_key = f"login:{_client_host(request)}:{username}"
 
         if not limiter.can_attempt(rate_key):
+            app.state.db.add_security_event(
+                event_type="login_rate_limited",
+                actor=username,
+                client_ip=_client_host(request),
+                user_agent=request.headers.get("user-agent"),
+                result="rejected",
+            )
             raise HTTPException(status_code=429, detail="too many failed login attempts")
 
         if not verify_admin_password(config, username, password):
             limiter.add_failure(rate_key)
+            app.state.db.add_security_event(
+                event_type="login_failed",
+                actor=username,
+                client_ip=_client_host(request),
+                user_agent=request.headers.get("user-agent"),
+                result="rejected",
+            )
             raise HTTPException(status_code=401, detail="invalid username or password")
 
         limiter.reset(rate_key)
         token, expires_at = create_session_token(config, username)
+        csrf_token = extract_csrf_token(config, token)
         set_session_cookie(
             response,
             token,
             max_age_seconds=config.session_ttl_hours * 3600,
             secure=config.secure_cookies or _request_is_secure(request, config),
         )
+        app.state.db.add_security_event(
+            event_type="login_success",
+            actor=username,
+            client_ip=_client_host(request),
+            user_agent=request.headers.get("user-agent"),
+            result="accepted",
+        )
         return {
+            "csrf_token": csrf_token,
             "expires_at": expires_at,
             "username": username,
         }
 
     @app.post("/api/auth/logout")
-    async def logout(response: Response) -> dict[str, str]:
+    async def logout(response: Response, _: AuthContext = Depends(require_permission("authenticated"))) -> dict[str, str]:
         clear_session_cookie(response)
         return {"status": "signed_out"}
 
     @app.get("/api/auth/me")
-    async def me(user: str = Depends(require_admin_token)) -> dict[str, str]:
-        return {"username": user}
+    async def me(request: Request, auth: AuthContext = Depends(require_permission("nodes:read"))) -> dict[str, str]:
+        csrf_token = extract_csrf_token(config, request.cookies.get(SESSION_COOKIE_NAME))
+        return {"username": auth.actor, "role": auth.role, "csrf_token": csrf_token or ""}
 
     @app.get("/api/nodes")
-    async def list_nodes(_: str = Depends(require_admin_token)) -> list[dict[str, Any]]:
+    async def list_nodes(_: AuthContext = Depends(require_permission("nodes:read"))) -> list[dict[str, Any]]:
         return app.state.db.list_nodes()
 
     @app.get("/api/nodes/{node_id}/metrics")
     async def list_metrics(
         node_id: str,
         metric_range: str = Query("1h", alias="range"),
-        _: str = Depends(require_admin_token),
+        _: AuthContext = Depends(require_permission("metrics:read")),
     ) -> dict[str, Any]:
         if metric_range not in {"1h", "7d", "30d"}:
             raise HTTPException(status_code=400, detail="unsupported metric range")
@@ -193,21 +274,21 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.get("/api/containers")
     async def list_containers(
         node_id: str | None = None,
-        _: str = Depends(require_admin_token),
+        _: AuthContext = Depends(require_permission("containers:read")),
     ) -> list[dict[str, Any]]:
         return app.state.db.list_containers(node_id)
 
     @app.get("/api/commands")
     async def list_commands(
         limit: int = 100,
-        _: str = Depends(require_admin_token),
+        _: AuthContext = Depends(require_permission("commands:read")),
     ) -> list[dict[str, Any]]:
         return app.state.db.list_commands(limit=max(1, min(limit, 500)))
 
     @app.get("/api/audit-logs")
     async def list_audit_logs(
         limit: int = 100,
-        _: str = Depends(require_admin_token),
+        _: AuthContext = Depends(require_permission("audit:read")),
     ) -> list[dict[str, Any]]:
         return app.state.db.list_audit_logs(limit=max(1, min(limit, 500)))
 
@@ -215,7 +296,7 @@ def create_app(config: ServerConfig) -> FastAPI:
     async def create_command(
         node_id: str,
         request: Request,
-        user: str = Depends(require_admin_token),
+        auth: AuthContext = Depends(require_permission("commands:create")),
     ) -> dict[str, Any]:
         body = await request.json()
         action = str(body.get("action") or "")
@@ -230,9 +311,9 @@ def create_app(config: ServerConfig) -> FastAPI:
             raise HTTPException(status_code=404, detail="container is not known on this node")
         payload["container_id"] = container_id
 
-        command = app.state.db.create_command(node_id, action, payload, created_by=user)
+        command = app.state.db.create_command(node_id, action, payload, created_by=auth.actor)
         app.state.db.add_audit_log(
-            user=user,
+            user=auth.actor,
             action=action,
             target=str(payload.get("container_id")),
             node_id=node_id,
@@ -250,19 +331,34 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.websocket("/agent/ws")
     async def agent_ws(websocket: WebSocket) -> None:
         await websocket.accept()
-        if config.require_secure_transport and websocket.url.scheme != "wss":
+        if config.require_secure_transport and not _websocket_is_secure(websocket, config):
+            app.state.db.add_security_event(
+                event_type="agent_ws_rejected",
+                client_ip=_ws_client_host(websocket),
+                result="insecure_transport",
+            )
             await websocket.close(code=1008)
             return
 
         limiter: FailureRateLimiter = app.state.ws_limiter
         rate_key = f"agent-ws:{_ws_client_host(websocket)}"
         if not limiter.can_attempt(rate_key):
+            app.state.db.add_security_event(
+                event_type="agent_ws_rate_limited",
+                client_ip=_ws_client_host(websocket),
+                result="rejected",
+            )
             await websocket.close(code=1008)
             return
 
         auth = await _receive_ws_auth(websocket)
         if not auth:
             limiter.add_failure(rate_key)
+            app.state.db.add_security_event(
+                event_type="agent_auth_failed",
+                client_ip=_ws_client_host(websocket),
+                result="missing_auth",
+            )
             await websocket.close(code=1008)
             return
 
@@ -272,14 +368,39 @@ def create_app(config: ServerConfig) -> FastAPI:
 
         if credential is None:
             limiter.add_failure(rate_key)
+            app.state.db.add_security_event(
+                event_type="agent_auth_failed",
+                actor=node_id,
+                client_ip=_ws_client_host(websocket),
+                node_id=node_id or None,
+                result="invalid_credentials",
+            )
             await websocket.close(code=1008)
             return
 
         limiter.reset(rate_key)
         agent_name = credential.name or str(auth.get("agent_name") or node_id)
+        registered = await app.state.hub.register_agent(node_id, websocket)
+        if not registered:
+            app.state.db.add_security_event(
+                event_type="agent_duplicate_connection",
+                actor=node_id,
+                client_ip=_ws_client_host(websocket),
+                node_id=node_id,
+                result="rejected",
+            )
+            await websocket.close(code=1008)
+            return
         app.state.db.ensure_node(node_id, agent_name)
         app.state.db.mark_seen(node_id)
-        await app.state.hub.register_agent(node_id, websocket)
+        app.state.db.add_security_event(
+            event_type="agent_connected",
+            actor=node_id,
+            client_ip=_ws_client_host(websocket),
+            node_id=node_id,
+            result="accepted",
+            detail={"token_id": credential.token_id},
+        )
         await app.state.hub.broadcast_ui({"type": "node_connected", "node_id": node_id})
         await websocket.send_json({"type": "auth_ok", "node_id": node_id})
 
@@ -295,13 +416,23 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.websocket("/ws/ui")
     async def ui_ws(websocket: WebSocket) -> None:
         await websocket.accept()
-        if config.require_secure_transport and websocket.url.scheme != "wss":
+        if config.require_secure_transport and not _websocket_is_secure(websocket, config):
+            app.state.db.add_security_event(
+                event_type="ui_ws_rejected",
+                client_ip=_ws_client_host(websocket),
+                result="insecure_transport",
+            )
             await websocket.close(code=1008)
             return
 
         limiter: FailureRateLimiter = app.state.ws_limiter
         rate_key = f"ui-ws:{_ws_client_host(websocket)}"
         if not limiter.can_attempt(rate_key):
+            app.state.db.add_security_event(
+                event_type="ui_ws_rate_limited",
+                client_ip=_ws_client_host(websocket),
+                result="rejected",
+            )
             await websocket.close(code=1008)
             return
 
@@ -309,6 +440,11 @@ def create_app(config: ServerConfig) -> FastAPI:
         token = str((auth or {}).get("token") or "") or websocket.cookies.get(SESSION_COOKIE_NAME)
         if not verify_admin_token(config, token):
             limiter.add_failure(rate_key)
+            app.state.db.add_security_event(
+                event_type="ui_ws_auth_failed",
+                client_ip=_ws_client_host(websocket),
+                result="invalid_credentials",
+            )
             await websocket.close(code=1008)
             return
         limiter.reset(rate_key)
@@ -349,7 +485,8 @@ def _validate_startup_security(config: ServerConfig) -> None:
             weak.append(key)
     if config.admin_password == "dev-admin-password" or config.admin_password_hash == DEV_ADMIN_PASSWORD_HASH:
         weak.append("admin_password_hash")
-    if not config.admin_password_hash and not config.admin_password:
+    has_user_password = any(user.enabled and (user.password_hash or user.password) for user in config.users)
+    if not config.admin_password_hash and not config.admin_password and not has_user_password:
         weak.append("admin_password_missing")
     if config.admin_password_hash and not is_secret_hash(config.admin_password_hash):
         weak.append("invalid_admin_password_hash")
@@ -363,10 +500,16 @@ def _validate_startup_security(config: ServerConfig) -> None:
         weak.append("invalid_agent_token_hash")
     if config.admin_password:
         weak.append("plaintext_admin_password")
+    if any(user.password for user in config.users):
+        weak.append("plaintext_user_password")
+    if any(user.password_hash and not is_secret_hash(user.password_hash) for user in config.users):
+        weak.append("invalid_user_password_hash")
     if any(agent.token for agent in config.agents):
         weak.append("plaintext_agent_token")
     for key in ("admin_token", "session_secret"):
         value = str(getattr(config, key) or "")
+        if key == "admin_token" and not value:
+            continue
         if _looks_placeholder(value) or len(value) < 24:
             weak.append(key)
     if any(_looks_placeholder(agent.token) for agent in config.agents):
@@ -382,6 +525,10 @@ def _validate_startup_security(config: ServerConfig) -> None:
         raise RuntimeError("Production mode requires secure_cookies=true")
     if config.environment.lower() == "production" and not config.require_secure_transport:
         raise RuntimeError("Production mode requires require_secure_transport=true")
+    if config.environment.lower() == "production" and config.admin_token:
+        raise RuntimeError("admin_token is disabled in production")
+    if any(token.enabled and token.token_hash and not is_secret_hash(token.token_hash) for token in config.api_tokens):
+        raise RuntimeError("Invalid api token hash")
 
 
 async def _handle_agent_message(app: FastAPI, node_id: str, message: dict[str, Any]) -> None:
@@ -408,7 +555,18 @@ async def _handle_agent_message(app: FastAPI, node_id: str, message: dict[str, A
         return
 
     if message_type == "metrics":
-        db.save_metrics(node_id, data)
+        try:
+            payload = MetricsPayload.model_validate(data).model_dump(exclude_none=True)
+        except ValidationError as exc:
+            db.add_security_event(
+                event_type="agent_payload_invalid",
+                actor=node_id,
+                node_id=node_id,
+                result="rejected",
+                detail={"message_type": message_type, "errors": exc.errors()},
+            )
+            return
+        db.save_metrics(node_id, payload)
         await hub.broadcast_ui({"type": "metrics_updated", "node_id": node_id})
         return
 
@@ -420,7 +578,21 @@ async def _handle_agent_message(app: FastAPI, node_id: str, message: dict[str, A
             "docker_inventory",
         )
         if isinstance(containers, list):
-            db.replace_inventory(node_id, containers)
+            try:
+                payloads = [
+                    DockerContainerPayload.model_validate(item).model_dump(exclude_none=True)
+                    for item in containers
+                ]
+            except ValidationError as exc:
+                db.add_security_event(
+                    event_type="agent_payload_invalid",
+                    actor=node_id,
+                    node_id=node_id,
+                    result="rejected",
+                    detail={"message_type": message_type, "errors": exc.errors()},
+                )
+                return
+            db.replace_inventory(node_id, payloads)
             await hub.broadcast_ui({"type": "containers_updated", "node_id": node_id})
         return
 
@@ -432,24 +604,58 @@ async def _handle_agent_message(app: FastAPI, node_id: str, message: dict[str, A
             "docker_stats",
         )
         if isinstance(stats, list):
-            db.update_container_stats(node_id, stats)
+            try:
+                payloads = [
+                    DockerStatsPayload.model_validate(item).model_dump(exclude_none=True)
+                    for item in stats
+                ]
+            except ValidationError as exc:
+                db.add_security_event(
+                    event_type="agent_payload_invalid",
+                    actor=node_id,
+                    node_id=node_id,
+                    result="rejected",
+                    detail={"message_type": message_type, "errors": exc.errors()},
+                )
+                return
+            db.update_container_stats(node_id, payloads)
             await hub.broadcast_ui({"type": "containers_updated", "node_id": node_id})
         return
 
     if message_type == "command_result":
-        command_id = str(data.get("command_id") or message.get("command_id") or "")
-        status = str(data.get("status") or "failed")
-        result_message = _bounded_text(data.get("message"), config.agent_payload_limits.max_result_message_bytes)
-        command = db.mark_command_result(command_id, status, result_message)
+        result_data = dict(data)
+        if "command_id" not in result_data and message.get("command_id"):
+            result_data["command_id"] = message.get("command_id")
+        try:
+            payload = CommandResultPayload.model_validate(result_data)
+        except ValidationError as exc:
+            db.add_security_event(
+                event_type="agent_payload_invalid",
+                actor=node_id,
+                node_id=node_id,
+                result="rejected",
+                detail={"message_type": message_type, "errors": exc.errors()},
+            )
+            return
+        result_message = _bounded_text(payload.message, config.agent_payload_limits.max_result_message_bytes)
+        command = db.mark_command_result(payload.command_id, node_id, payload.status, result_message)
         if command:
             db.add_audit_log(
                 user="agent",
                 action=command["action"],
                 target=str(command["payload"].get("container_id")),
                 node_id=node_id,
-                result=status,
+                result=payload.status,
             )
             await hub.broadcast_ui({"type": "command_updated", "command": command})
+        else:
+            db.add_security_event(
+                event_type="command_result_node_mismatch",
+                actor=node_id,
+                node_id=node_id,
+                target=payload.command_id,
+                result="rejected",
+            )
         return
 
 
@@ -463,6 +669,23 @@ async def _status_watcher(app: FastAPI) -> None:
         )
         for change in changes:
             await app.state.hub.broadcast_ui({"type": "node_status_changed", **change})
+        for command in app.state.db.expire_stale_commands(config.command.timeout_seconds):
+            app.state.db.add_audit_log(
+                user="system",
+                action=command["action"],
+                target=str(command["payload"].get("container_id")),
+                node_id=command["node_id"],
+                result="timeout",
+            )
+            await app.state.hub.broadcast_ui({"type": "command_updated", "command": command})
+        pruned = app.state.db.prune_metrics(config.retention.raw_metrics_days)
+        if pruned:
+            app.state.db.add_security_event(
+                event_type="metrics_retention_pruned",
+                actor="system",
+                result="success",
+                detail={"rows": pruned},
+            )
 
 
 def _bounded_list(value: Any, limit: int, node_id: str, message_type: str) -> list[dict[str, Any]]:
@@ -495,6 +718,15 @@ def _request_is_secure(request: Request, config: ServerConfig) -> bool:
         return False
     forwarded_proto = request.headers.get("x-forwarded-proto", "")
     return forwarded_proto.split(",", 1)[0].strip().lower() == "https"
+
+
+def _websocket_is_secure(websocket: WebSocket, config: ServerConfig) -> bool:
+    if websocket.url.scheme == "wss":
+        return True
+    if not config.trust_proxy_headers:
+        return False
+    forwarded_proto = websocket.headers.get("x-forwarded-proto", "")
+    return forwarded_proto.split(",", 1)[0].strip().lower() in {"https", "wss"}
 
 
 def _client_host(request: Request) -> str:

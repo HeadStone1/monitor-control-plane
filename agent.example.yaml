@@ -14,3 +14,5 @@ intervals:
 
 docker:
   enabled: true
+  allowed_labels:
+    monitor.control-plane.allow: "true"
