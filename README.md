@@ -262,6 +262,59 @@ This project is source-available under the Monitor Personal Use License v0.1.
 
 See [LICENSE](LICENSE) for details.
 
+## Latest Update
+
+The latest release hardens the project from a local MVP into a safer
+single-instance control plane. The main changes are:
+
+- Authentication now rejects plaintext admin passwords and legacy PBKDF2
+  hashes. Admin passwords, Agent tokens, and API tokens must use Argon2id
+  hashes generated with `python -m server.monitor_server --hash-secret`.
+- Browser sessions include CSRF protection, scoped RBAC permissions, and
+  production startup checks for secure cookies, secure transport, and disabled
+  static `admin_token`.
+- Agent authentication is bound to `node_id`, duplicate Agent connections are
+  rejected, WebSocket secure-transport checks understand trusted proxy headers,
+  and Agent payloads are schema-validated before database writes.
+- Container commands now have a full `sent -> acknowledged -> running ->
+  success/failed/timeout` lifecycle, with node-bound command result updates and
+  timeout auditing.
+- Docker control actions require allowed container labels, so unlabeled
+  containers remain visible but cannot be started, stopped, or restarted by the
+  Agent.
+- SQLite now uses WAL mode, includes backup scripts, raw metric retention, and
+  hourly/daily rollup tables for long-range metric queries.
+- Thresholds are stored on the Server, alerts are evaluated server-side, and the
+  WebUI shows alert counts, audit filters, CSV export, node overview cards,
+  command confirmation dialogs, dark mode, container filters, and chart
+  drag-to-zoom.
+- CI now runs compile checks, pytest, JavaScript syntax checks, and `pip-audit`;
+  Dependabot is enabled for GitHub Actions and Python dependencies.
+- Deployment examples now include systemd units, Dockerfile, Docker Compose,
+  SQLite backup scripts, and deployment notes.
+
+## Development Workflow
+
+The `main` branch should be protected. Do not push feature or security work
+directly to `main`.
+
+Recommended workflow:
+
+```text
+create a feature branch -> push the branch -> open a pull request -> wait for CI -> merge
+```
+
+Required local checks before opening a pull request:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall agent server tests
+.\.venv\Scripts\python.exe -m pytest tests
+node --check web/app.js
+.\.venv\Scripts\python.exe -m pip_audit -r requirements.txt
+```
+
+The GitHub Actions workflow runs the same core checks on pull requests.
+
 ## Security Hardening Update
 
 The current security baseline is stricter than the initial MVP:
