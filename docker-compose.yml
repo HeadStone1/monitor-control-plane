@@ -1,0 +1,60 @@
+services:
+  monitor-server:
+    build:
+      context: .
+      target: server
+    image: monitor-control-plane/server:local
+    command: ["python", "-m", "server.monitor_server", "--config", "/config/server.yaml"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      MONITOR_HOST: 0.0.0.0
+      MONITOR_DATABASE_PATH: /app/data/monitor.db
+    volumes:
+      - ./server.yaml:/config/server.yaml:ro
+      - monitor-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  monitor-agent:
+    profiles:
+      - agent
+    build:
+      context: .
+      target: agent
+    image: monitor-control-plane/agent:local
+    command: ["python", "-m", "agent.monitor_agent", "--config", "/config/agent.yaml"]
+    volumes:
+      - ./agent.yaml:/config/agent.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+volumes:
+  monitor-data:

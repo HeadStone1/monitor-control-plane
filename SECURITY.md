@@ -86,10 +86,18 @@ For private security reports, contact the repository owner. Do not publish explo
 
 ## Implemented Hardening After Audit
 
-- Admin passwords can now be stored as PBKDF2 hashes with `admin_password_hash`.
-- Agent tokens can now be stored as PBKDF2 hashes with per-node `agents[].token_hash`.
+- Admin passwords must be stored as Argon2id hashes with `admin_password_hash`; plaintext admin passwords and legacy PBKDF2 hashes are rejected.
+- Agent tokens must be stored as Argon2id hashes with per-node `agents[].token_hash`; plaintext `agent_tokens`, `MONITOR_AGENT_TOKENS`, and `agents[].token` are rejected.
 - Agent authentication now binds a token to a specific `node_id`; a token for one node cannot claim another node.
+- Runtime config reload updates users, roles, API tokens, and Agent credentials without restarting the Server.
+- Agent credentials can be revoked at runtime; revocation disables the in-memory credential, disconnects the current WebSocket, and writes an audit event.
+- Container command delivery now has ACK and running states before the final success/failed result, with state-aware timeout audit records.
+- Metrics are rolled up into hourly and daily summaries to reduce long-range raw-data scans.
+- Threshold settings are stored server-side and generate active/resolved alert events.
+- Audit logs support node/action/time filtering and WebUI CSV export for incident review.
 - Production mode refuses plaintext admin passwords, plaintext Agent tokens, development defaults, insecure cookies, and missing secure-transport enforcement.
+- Deployment examples include hardened systemd units, daily SQLite backup timer, a non-root Dockerfile, and Docker Compose with the Agent socket mount behind an opt-in profile.
+- Prometheus scraping is supported through `/metrics`, but it requires a scoped `metrics:read` token.
 - Login and WebSocket authentication failures are rate limited.
 - Agent container inventory and command result messages are capped to reduce resource exhaustion.
 - Non-loopback Agent `ws://` connections are blocked unless explicitly allowed by configuration.

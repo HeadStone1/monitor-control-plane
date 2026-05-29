@@ -14,7 +14,7 @@ def main() -> None:
     parser.add_argument("--config", default="server.yaml", help="Path to server YAML config.")
     parser.add_argument("--host", help="Override bind host.")
     parser.add_argument("--port", type=int, help="Override bind port.")
-    parser.add_argument("--hash-secret", help="Print a PBKDF2 hash for an admin password or agent token.")
+    parser.add_argument("--hash-secret", help="Print an Argon2id hash for an admin password or agent token.")
     args = parser.parse_args()
 
     if args.hash_secret:

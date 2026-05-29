@@ -64,7 +64,15 @@
             <h1>Server Dashboard</h1>
           </div>
           <div class="header-actions">
+            <div class="alert-menu">
+              <button id="alerts-toggle" class="alert-button" type="button">
+                Alerts
+                <span id="alert-count">0</span>
+              </button>
+              <div id="alert-panel" class="alert-panel is-hidden"></div>
+            </div>
             <span id="current-user" class="user-pill"></span>
+            <button id="theme-toggle" type="button" class="theme-toggle">Dark</button>
             <button id="refresh" type="button">Refresh</button>
           </div>
         </header>
@@ -92,6 +100,8 @@
           </article>
         </section>
 
+        <section id="node-overview" class="node-overview-grid" aria-label="node overview"></section>
+
         <section class="dashboard-grid">
           <section class="panel node-panel">
             <div class="panel-title">
@@ -117,6 +127,7 @@
                 <button type="button" data-range="7d">7d</button>
                 <button type="button" data-range="30d">30d</button>
               </div>
+              <button id="chart-zoom-reset" type="button" class="chart-zoom-reset is-hidden">Reset zoom</button>
               <div class="threshold-controls" aria-label="metric thresholds">
                 <label>
                   CPU
@@ -147,12 +158,20 @@
         </section>
 
         <section id="containers" class="panel">
-          <div class="panel-title">
-            <div>
-              <h2>Containers</h2>
-              <p>Start, stop, and restart commands are sent through the connected agent.</p>
+            <div class="panel-title">
+              <div>
+                <h2>Containers</h2>
+                <p>Start, stop, and restart commands are sent through the connected agent.</p>
+              </div>
             </div>
-          </div>
+            <div class="container-controls">
+              <input id="container-search" type="search" placeholder="Search name or image" />
+              <select id="container-status-filter" aria-label="container status filter">
+                <option value="all">All statuses</option>
+                <option value="running">Running</option>
+                <option value="stopped">Stopped</option>
+              </select>
+            </div>
           <div class="table-wrap">
             <table>
               <thead>
@@ -188,6 +207,13 @@
                 <p>Operator, action, target, and result</p>
               </div>
             </div>
+            <div class="audit-controls">
+              <input id="audit-node-filter" type="text" placeholder="Node" />
+              <input id="audit-action-filter" type="text" placeholder="Action" />
+              <input id="audit-from-filter" type="datetime-local" />
+              <input id="audit-to-filter" type="datetime-local" />
+              <button id="audit-export" type="button">Export CSV</button>
+            </div>
             <div id="audit-list" class="event-list"></div>
           </section>
         </section>
@@ -195,6 +221,16 @@
     </section>
 
     <div id="toast" class="toast" role="status"></div>
+    <div id="command-dialog" class="modal-backdrop is-hidden" role="dialog" aria-modal="true" aria-labelledby="command-dialog-title">
+      <div class="modal">
+        <h2 id="command-dialog-title">Confirm command</h2>
+        <p id="command-dialog-message"></p>
+        <div class="modal-actions">
+          <button id="command-dialog-cancel" type="button">Cancel</button>
+          <button id="command-dialog-confirm" type="button" class="danger">Confirm</button>
+        </div>
+      </div>
+    </div>
     <script src="/app.js"></script>
   </body>
 </html>

@@ -8,13 +8,14 @@ from typing import Any
 import yaml
 
 
+ARGON2_HASH_PREFIX = "$argon2id$"
 DEV_ADMIN_PASSWORD_HASH = (
-    "pbkdf2_sha256$310000$bW9uaXRvci1kZXYtYWRtaW4tc2FsdA$"
-    "-82Brrs8OuexgSIZ36iHB783tRwRnYOKUUwHR3QBp5A"
+    "$argon2id$v=19$m=65536,t=3,p=2$i2Ya6cFy/RyasiIt5G0rYg$"
+    "SXc3BGbPeBlcXe7hhqBuAg9AG3FgPvgnJBb4l5dHWP8"
 )
 DEV_AGENT_TOKEN_HASH = (
-    "pbkdf2_sha256$310000$bW9uaXRvci1kZXYtYWdlbnQtc2FsdA$"
-    "F4pWYJLeR4YG4mBmyS6HP-3wRV3syvJU0QBSkREPCxM"
+    "$argon2id$v=19$m=65536,t=3,p=2$fzC/vKa3DtBEDACUlhKrvg$"
+    "3zGHBTY1zqdy7xCDWP61nGuckSvrqfBOSVwt/RIRdy4"
 )
 
 
@@ -29,7 +30,6 @@ class AgentCredential:
     node_id: str
     name: str
     token_hash: str = ""
-    token: str = ""
     token_id: str = ""
     created_at: str = ""
     enabled: bool = True
@@ -48,7 +48,6 @@ class ApiTokenConfig:
 class UserConfig:
     username: str
     password_hash: str = ""
-    password: str = ""
     role: str = "viewer"
     enabled: bool = True
 
@@ -76,10 +75,14 @@ class CommandConfig:
 @dataclass(slots=True)
 class RetentionConfig:
     raw_metrics_days: int = 7
+    hourly_rollup_days: int = 90
+    daily_rollup_days: int = 365
+    rollup_interval_seconds: int = 3600
 
 
 @dataclass(slots=True)
 class ServerConfig:
+    config_path: Path | None = None
     host: str = "127.0.0.1"
     port: int = 8000
     environment: str = "development"
@@ -88,7 +91,6 @@ class ServerConfig:
     admin_token: str = "dev-admin-token"
     admin_username: str = "admin"
     admin_password_hash: str = DEV_ADMIN_PASSWORD_HASH
-    admin_password: str = ""
     users: list[UserConfig] = field(default_factory=list)
     roles: dict[str, list[str]] = field(
         default_factory=lambda: {
@@ -145,6 +147,34 @@ def _env_list(name: str, fallback: list[str]) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _reject_plaintext_passwords(raw: dict[str, Any]) -> None:
+    if str(raw.get("admin_password") or "").strip():
+        raise ValueError("Plaintext admin_password is not supported; use admin_password_hash")
+    if str(os.getenv("MONITOR_ADMIN_PASSWORD") or "").strip():
+        raise ValueError("MONITOR_ADMIN_PASSWORD is not supported; use MONITOR_ADMIN_PASSWORD_HASH")
+    if raw.get("agent_tokens"):
+        raise ValueError("Plaintext agent_tokens is not supported; use agents[].token_hash")
+    if str(os.getenv("MONITOR_AGENT_TOKENS") or "").strip():
+        raise ValueError("MONITOR_AGENT_TOKENS is not supported; use agents[].token_hash")
+
+    users_raw = raw.get("users")
+    if isinstance(users_raw, list):
+        for item in users_raw:
+            if isinstance(item, dict) and str(item.get("password") or "").strip():
+                raise ValueError("Plaintext users[].password is not supported; use users[].password_hash")
+
+    agents_raw = raw.get("agents")
+    if isinstance(agents_raw, list):
+        for item in agents_raw:
+            if isinstance(item, dict) and str(item.get("token") or "").strip():
+                raise ValueError("Plaintext agents[].token is not supported; use agents[].token_hash")
+
+
+def _require_argon2id_hash(label: str, encoded: str) -> None:
+    if encoded and not encoded.startswith(ARGON2_HASH_PREFIX):
+        raise ValueError(f"{label} must be an Argon2id hash generated with --hash-secret")
+
+
 def _load_agents(raw: dict[str, Any]) -> list[AgentCredential]:
     agents_raw = raw.get("agents")
     if isinstance(agents_raw, list) and agents_raw:
@@ -155,12 +185,13 @@ def _load_agents(raw: dict[str, Any]) -> list[AgentCredential]:
             node_id = str(item.get("node_id") or item.get("agent_id") or "").strip()
             if not node_id:
                 continue
+            token_hash = str(item.get("token_hash") or "")
+            _require_argon2id_hash("agents[].token_hash", token_hash)
             agents.append(
                 AgentCredential(
                     node_id=node_id,
                     name=str(item.get("name") or item.get("agent_name") or node_id),
-                    token_hash=str(item.get("token_hash") or ""),
-                    token=str(item.get("token") or ""),
+                    token_hash=token_hash,
                     token_id=str(item.get("token_id") or item.get("id") or ""),
                     created_at=str(item.get("created_at") or ""),
                     enabled=bool(item.get("enabled", True)),
@@ -168,17 +199,6 @@ def _load_agents(raw: dict[str, Any]) -> list[AgentCredential]:
             )
         if agents:
             return agents
-
-    legacy_tokens = [str(item) for item in raw.get("agent_tokens", []) if str(item)]
-    if legacy_tokens:
-        return [
-            AgentCredential(
-                node_id="dev-agent" if index == 0 else f"legacy-agent-{index + 1}",
-                name="dev-agent" if index == 0 else f"legacy-agent-{index + 1}",
-                token=token,
-            )
-            for index, token in enumerate(legacy_tokens)
-        ]
 
     return [
         AgentCredential(
@@ -189,7 +209,7 @@ def _load_agents(raw: dict[str, Any]) -> list[AgentCredential]:
     ]
 
 
-def _load_users(raw: dict[str, Any], admin_username: str, admin_password_hash: str, admin_password: str) -> list[UserConfig]:
+def _load_users(raw: dict[str, Any], admin_username: str, admin_password_hash: str) -> list[UserConfig]:
     users_raw = raw.get("users")
     if isinstance(users_raw, list) and users_raw:
         users: list[UserConfig] = []
@@ -199,11 +219,12 @@ def _load_users(raw: dict[str, Any], admin_username: str, admin_password_hash: s
             username = str(item.get("username") or "").strip()
             if not username:
                 continue
+            password_hash = str(item.get("password_hash") or "")
+            _require_argon2id_hash("users[].password_hash", password_hash)
             users.append(
                 UserConfig(
                     username=username,
-                    password_hash=str(item.get("password_hash") or ""),
-                    password=str(item.get("password") or ""),
+                    password_hash=password_hash,
                     role=str(item.get("role") or "viewer"),
                     enabled=bool(item.get("enabled", True)),
                 )
@@ -215,7 +236,6 @@ def _load_users(raw: dict[str, Any], admin_username: str, admin_password_hash: s
         UserConfig(
             username=admin_username,
             password_hash=admin_password_hash,
-            password=admin_password,
             role="admin",
         )
     ]
@@ -250,6 +270,7 @@ def _load_api_tokens(raw: dict[str, Any]) -> list[ApiTokenConfig]:
         scopes_raw = item.get("scopes") or []
         if not name or not token_hash or not isinstance(scopes_raw, list):
             continue
+        _require_argon2id_hash("api_tokens[].token_hash", token_hash)
         tokens.append(
             ApiTokenConfig(
                 name=name,
@@ -271,9 +292,7 @@ def load_server_config(path: str | None) -> ServerConfig:
         with config_path.open("r", encoding="utf-8") as file:
             raw = yaml.safe_load(file) or {}
 
-    env_agent_tokens = os.getenv("MONITOR_AGENT_TOKENS")
-    if env_agent_tokens and "agents" not in raw:
-        raw["agent_tokens"] = [item.strip() for item in env_agent_tokens.split(",") if item.strip()]
+    _reject_plaintext_passwords(raw)
 
     heartbeat_raw = raw.get("heartbeat") or {}
     rate_limit_raw = raw.get("auth_rate_limit") or {}
@@ -282,14 +301,13 @@ def load_server_config(path: str | None) -> ServerConfig:
     retention_raw = raw.get("retention") or {}
     admin_password_hash_default = raw.get("admin_password_hash")
     if admin_password_hash_default is None:
-        admin_password_hash_default = "" if (
-            "users" in raw or "admin_password" in raw or os.getenv("MONITOR_ADMIN_PASSWORD")
-        ) else DEV_ADMIN_PASSWORD_HASH
+        admin_password_hash_default = "" if "users" in raw else DEV_ADMIN_PASSWORD_HASH
     allowed_hosts = [str(item) for item in raw.get("allowed_hosts", ["127.0.0.1", "localhost"])]
     admin_username = str(_env("MONITOR_ADMIN_USERNAME", raw.get("admin_username", "admin")))
     admin_password_hash = str(_env("MONITOR_ADMIN_PASSWORD_HASH", admin_password_hash_default))
-    admin_password = str(_env("MONITOR_ADMIN_PASSWORD", raw.get("admin_password", "")))
+    _require_argon2id_hash("admin_password_hash", admin_password_hash)
     return ServerConfig(
+        config_path=config_path,
         host=str(_env("MONITOR_HOST", raw.get("host", "127.0.0.1"))),
         port=int(_env("MONITOR_PORT", raw.get("port", 8000))),
         environment=str(_env("MONITOR_ENV", raw.get("environment", "development"))),
@@ -301,8 +319,7 @@ def load_server_config(path: str | None) -> ServerConfig:
         admin_token=str(_env("MONITOR_ADMIN_TOKEN", raw.get("admin_token", "dev-admin-token"))),
         admin_username=admin_username,
         admin_password_hash=admin_password_hash,
-        admin_password=admin_password,
-        users=_load_users(raw, admin_username, admin_password_hash, admin_password),
+        users=_load_users(raw, admin_username, admin_password_hash),
         roles=_load_roles(raw),
         api_tokens=_load_api_tokens(raw),
         session_secret=str(_env("MONITOR_SESSION_SECRET", raw.get("session_secret", "dev-session-secret-change-me"))),
@@ -326,7 +343,12 @@ def load_server_config(path: str | None) -> ServerConfig:
             max_ports_entries=int(payload_limit_raw.get("max_ports_entries", 64)),
         ),
         command=CommandConfig(timeout_seconds=int(command_raw.get("timeout_seconds", 60))),
-        retention=RetentionConfig(raw_metrics_days=int(retention_raw.get("raw_metrics_days", 7))),
+        retention=RetentionConfig(
+            raw_metrics_days=int(retention_raw.get("raw_metrics_days", 7)),
+            hourly_rollup_days=int(retention_raw.get("hourly_rollup_days", 90)),
+            daily_rollup_days=int(retention_raw.get("daily_rollup_days", 365)),
+            rollup_interval_seconds=int(retention_raw.get("rollup_interval_seconds", 3600)),
+        ),
         heartbeat=HeartbeatConfig(
             warning_after_seconds=int(heartbeat_raw.get("warning_after_seconds", 30)),
             offline_after_seconds=int(heartbeat_raw.get("offline_after_seconds", 60)),

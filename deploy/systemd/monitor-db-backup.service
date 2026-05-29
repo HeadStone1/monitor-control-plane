@@ -1,0 +1,19 @@
+[Unit]
+Description=Back up Monitor SQLite database
+Requires=monitor-server.service
+After=monitor-server.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/monitor
+Environment=MONITOR_DATABASE_PATH=/var/lib/monitor/monitor.db
+Environment=MONITOR_BACKUP_DIR=/var/backups/monitor
+ExecStart=/usr/bin/env bash /opt/monitor/scripts/backup_sqlite.sh
+User=monitor
+Group=monitor
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/monitor
+ReadOnlyPaths=/var/lib/monitor

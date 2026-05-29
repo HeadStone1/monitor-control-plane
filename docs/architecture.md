@@ -16,7 +16,7 @@ Agents always initiate the connection to the server. The server does not SSH int
 - Development URL: `ws://server/agent/ws`.
 - Production URL: `wss://server/agent/ws`.
 - Payload format: JSON.
-- Authentication: token in WebSocket query string for the first MVP.
+- Authentication: the first WebSocket message is `{"type":"auth","agent_id":"...","token":"..."}`. Tokens are never sent in URL query strings.
 
 ## Agent Messages
 
@@ -38,6 +38,8 @@ Important message types:
 - `metrics`
 - `docker_inventory`
 - `docker_stats`
+- `command_ack`
+- `command_running`
 - `command_result`
 
 ## Server Messages
@@ -45,6 +47,7 @@ Important message types:
 ```json
 {
   "type": "command",
+  "request_id": "cmd_abc",
   "command_id": "cmd_abc",
   "action": "container.restart",
   "payload": {
@@ -57,7 +60,7 @@ Important message types:
 Command lifecycle:
 
 ```text
-pending -> sent -> running -> success / failed / timeout
+pending -> sent -> acknowledged -> running -> success / failed / timeout
 ```
 
 ## Security Notes
@@ -69,4 +72,3 @@ The Docker socket is effectively root-equivalent on many Linux systems. The agen
 - Admin sessions instead of static admin tokens.
 - Strict command allowlists.
 - Audit logs for all container operations.
-

@@ -75,6 +75,9 @@ command:
 
 retention:
   raw_metrics_days: 7
+  hourly_rollup_days: 90
+  daily_rollup_days: 365
+  rollup_interval_seconds: 3600
 
 heartbeat:
   warning_after_seconds: 30

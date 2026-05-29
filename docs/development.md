@@ -57,7 +57,8 @@ On Windows, the agent can still send basic host metrics. Docker data is primaril
 
 - Put the server behind Caddy or Nginx.
 - Use HTTPS/WSS.
-- Replace static development tokens with per-agent tokens.
-- Store admin passwords as hashes.
-- Run the Linux agent as a `systemd` service.
-- Restrict Docker command actions to a strict allowlist.
+- Use Argon2id `admin_password_hash` and per-node `agents[].token_hash`.
+- Run the Server and Linux Agent with the `deploy/systemd` units.
+- Enable the `monitor-db-backup.timer` timer for SQLite backups.
+- Keep Docker label restrictions enabled for remote container operations.
+- See `docs/deployment.md` for systemd and Docker Compose examples.

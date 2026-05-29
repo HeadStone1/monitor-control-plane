@@ -26,6 +26,39 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
+def _alert_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    item = _row_to_dict(row)
+    item["detail"] = _loads(item.pop("detail_json", None), {})
+    return item
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:
+        return None
+    return number
+
+
+def _normalize_thresholds(values: dict[str, Any]) -> dict[str, float | None]:
+    normalized: dict[str, float | None] = {}
+    for metric in ALERT_METRIC_FIELDS:
+        value = values.get(metric)
+        if value is None or value == "":
+            normalized[metric] = None
+            continue
+        number = _float_or_none(value)
+        if number is None:
+            normalized[metric] = None
+            continue
+        normalized[metric] = max(0.0, min(100.0, number))
+    return normalized
+
+
 def _parse_utc(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -36,6 +69,14 @@ def _parse_utc(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+DEFAULT_THRESHOLDS = {"cpu": 60.0, "memory": 80.0, "disk": 85.0}
+ALERT_METRIC_FIELDS = {
+    "cpu": "cpu_percent",
+    "memory": "memory_percent",
+    "disk": "disk_percent",
+}
 
 
 def _bucket_start(value: datetime, bucket: str) -> datetime:
@@ -162,6 +203,70 @@ def _aggregate_metric_points(rows: list[dict[str, Any]], bucket: str) -> list[di
     return points
 
 
+def _rollup_metric_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    points: list[dict[str, Any]] = []
+    for row in rows:
+        points.append(
+            {
+                "captured_at": row.get("bucket_start"),
+                "bucket_start": row.get("bucket_start"),
+                "bucket_end": row.get("bucket_end"),
+                "sample_count": row.get("sample_count") or 0,
+                "cpu_percent": row.get("cpu_avg"),
+                "cpu_avg": row.get("cpu_avg"),
+                "cpu_max": row.get("cpu_max"),
+                "cpu_peak_at": row.get("cpu_peak_at"),
+                "memory_percent": row.get("memory_avg"),
+                "memory_avg": row.get("memory_avg"),
+                "memory_max": row.get("memory_max"),
+                "memory_peak_at": row.get("memory_peak_at"),
+                "disk_percent": row.get("disk_avg"),
+                "disk_avg": row.get("disk_avg"),
+                "disk_max": row.get("disk_max"),
+                "disk_peak_at": row.get("disk_peak_at"),
+                "load1": row.get("load1"),
+                "load5": row.get("load5"),
+                "load15": row.get("load15"),
+                "net_rx": row.get("net_rx"),
+                "net_tx": row.get("net_tx"),
+            }
+        )
+    return points
+
+
+def _metric_summary_from_points(points: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "sample_count": sum(int(point.get("sample_count") or 0) for point in points),
+        "cpu": _point_series_summary(points, "cpu"),
+        "memory": _point_series_summary(points, "memory"),
+        "disk": _point_series_summary(points, "disk"),
+    }
+
+
+def _point_series_summary(points: list[dict[str, Any]], prefix: str) -> dict[str, Any]:
+    weighted_total = 0.0
+    sample_total = 0
+    max_value = None
+    peak_at = None
+    for point in points:
+        avg = _float_or_none(point.get(f"{prefix}_avg"))
+        count = int(point.get("sample_count") or 0)
+        if avg is not None and count > 0:
+            weighted_total += avg * count
+            sample_total += count
+
+        peak_value = _float_or_none(point.get(f"{prefix}_max"))
+        if peak_value is not None and (max_value is None or peak_value > max_value):
+            max_value = peak_value
+            peak_at = point.get(f"{prefix}_peak_at")
+
+    return {
+        "avg": round(weighted_total / sample_total, 2) if sample_total else None,
+        "max": round(max_value, 2) if max_value is not None else None,
+        "peak_at": peak_at,
+    }
+
+
 def _bucket_end(bucket_start: str, bucket: str) -> str:
     start = _parse_utc(bucket_start)
     if start is None:
@@ -180,6 +285,39 @@ def _aggregate_point_metric(prefix: str, rows: list[dict[str, Any]], key: str) -
     }
 
 
+def _rollup_record(
+    node_id: str,
+    bucket_start: str,
+    rows: list[dict[str, Any]],
+    bucket: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    cpu = _series_summary(rows, "cpu_percent")
+    memory = _series_summary(rows, "memory_percent")
+    disk = _series_summary(rows, "disk_percent")
+    return {
+        "node_id": node_id,
+        "bucket_start": bucket_start,
+        "bucket_end": _bucket_end(bucket_start, bucket),
+        "sample_count": len(rows),
+        "cpu_avg": cpu["avg"],
+        "cpu_max": cpu["max"],
+        "cpu_peak_at": cpu["peak_at"],
+        "memory_avg": memory["avg"],
+        "memory_max": memory["max"],
+        "memory_peak_at": memory["peak_at"],
+        "disk_avg": disk["avg"],
+        "disk_max": disk["max"],
+        "disk_peak_at": disk["peak_at"],
+        "load1": _average(_metric_values(rows, "load1")),
+        "load5": _average(_metric_values(rows, "load5")),
+        "load15": _average(_metric_values(rows, "load15")),
+        "net_rx": _average(_metric_values(rows, "net_rx")),
+        "net_tx": _average(_metric_values(rows, "net_tx")),
+        "updated_at": updated_at,
+    }
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -190,6 +328,9 @@ class Database:
 
     def init(self) -> None:
         with self._lock, self._conn:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS nodes (
@@ -226,6 +367,60 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_metrics_node_time
                     ON metrics(node_id, captured_at DESC);
 
+                CREATE TABLE IF NOT EXISTS metrics_hourly (
+                    node_id TEXT NOT NULL,
+                    bucket_start TEXT NOT NULL,
+                    bucket_end TEXT NOT NULL,
+                    sample_count INTEGER NOT NULL,
+                    cpu_avg REAL,
+                    cpu_max REAL,
+                    cpu_peak_at TEXT,
+                    memory_avg REAL,
+                    memory_max REAL,
+                    memory_peak_at TEXT,
+                    disk_avg REAL,
+                    disk_max REAL,
+                    disk_peak_at TEXT,
+                    load1 REAL,
+                    load5 REAL,
+                    load15 REAL,
+                    net_rx REAL,
+                    net_tx REAL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(node_id, bucket_start),
+                    FOREIGN KEY(node_id) REFERENCES nodes(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS metrics_daily (
+                    node_id TEXT NOT NULL,
+                    bucket_start TEXT NOT NULL,
+                    bucket_end TEXT NOT NULL,
+                    sample_count INTEGER NOT NULL,
+                    cpu_avg REAL,
+                    cpu_max REAL,
+                    cpu_peak_at TEXT,
+                    memory_avg REAL,
+                    memory_max REAL,
+                    memory_peak_at TEXT,
+                    disk_avg REAL,
+                    disk_max REAL,
+                    disk_peak_at TEXT,
+                    load1 REAL,
+                    load5 REAL,
+                    load15 REAL,
+                    net_rx REAL,
+                    net_tx REAL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(node_id, bucket_start),
+                    FOREIGN KEY(node_id) REFERENCES nodes(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_metrics_hourly_node_time
+                    ON metrics_hourly(node_id, bucket_start DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_metrics_daily_node_time
+                    ON metrics_daily(node_id, bucket_start DESC);
+
                 CREATE TABLE IF NOT EXISTS containers (
                     node_id TEXT NOT NULL,
                     container_id TEXT NOT NULL,
@@ -252,6 +447,8 @@ class Database:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     sent_at TEXT,
+                    acknowledged_at TEXT,
+                    running_at TEXT,
                     finished_at TEXT,
                     FOREIGN KEY(node_id) REFERENCES nodes(id)
                 );
@@ -273,6 +470,32 @@ class Database:
                     detail_json TEXT,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL,
+                    metric TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    threshold REAL NOT NULL,
+                    value REAL NOT NULL,
+                    triggered_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    detail_json TEXT,
+                    FOREIGN KEY(node_id) REFERENCES nodes(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_alerts_node_status_time
+                    ON alerts(node_id, status, triggered_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_alerts_status_time
+                    ON alerts(status, triggered_at DESC);
                 """
             )
             self._ensure_column("audit_logs", "event_type", "TEXT")
@@ -280,6 +503,8 @@ class Database:
             self._ensure_column("audit_logs", "client_ip", "TEXT")
             self._ensure_column("audit_logs", "user_agent", "TEXT")
             self._ensure_column("audit_logs", "detail_json", "TEXT")
+            self._ensure_column("commands", "acknowledged_at", "TEXT")
+            self._ensure_column("commands", "running_at", "TEXT")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         existing = {
@@ -386,6 +611,123 @@ class Database:
                 ),
             )
 
+    def get_thresholds(self) -> tuple[dict[str, float | None], bool]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value_json FROM settings WHERE key = ?",
+                ("thresholds",),
+            ).fetchone()
+        if not row:
+            return DEFAULT_THRESHOLDS.copy(), False
+        raw = _loads(row["value_json"], {})
+        if not isinstance(raw, dict):
+            return DEFAULT_THRESHOLDS.copy(), False
+        return _normalize_thresholds(raw), True
+
+    def set_thresholds(self, thresholds: dict[str, Any]) -> dict[str, float | None]:
+        normalized = _normalize_thresholds(thresholds)
+        now = utc_now()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO settings (key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                ("thresholds", json.dumps(normalized, ensure_ascii=True), now),
+            )
+        return normalized
+
+    def evaluate_metric_alerts(
+        self,
+        node_id: str,
+        metrics: dict[str, Any],
+        thresholds: dict[str, float | None],
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        now = utc_now()
+        normalized = _normalize_thresholds(thresholds)
+        with self._lock, self._conn:
+            for metric, field in ALERT_METRIC_FIELDS.items():
+                threshold = normalized.get(metric)
+                if threshold is None:
+                    continue
+                value = _float_or_none(metrics.get(field))
+                if value is None:
+                    continue
+
+                active = self._conn.execute(
+                    """
+                    SELECT * FROM alerts
+                    WHERE node_id = ? AND metric = ? AND status = 'active'
+                    ORDER BY triggered_at DESC
+                    LIMIT 1
+                    """,
+                    (node_id, metric),
+                ).fetchone()
+
+                if value > threshold:
+                    if active:
+                        self._conn.execute(
+                            """
+                            UPDATE alerts
+                            SET threshold = ?, value = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (threshold, value, now, active["id"]),
+                        )
+                        continue
+                    alert_id = f"alert_{uuid.uuid4().hex}"
+                    detail = {
+                        "field": field,
+                        "captured_at": metrics.get("captured_at"),
+                    }
+                    self._conn.execute(
+                        """
+                        INSERT INTO alerts (
+                            id, node_id, metric, status, threshold, value,
+                            triggered_at, updated_at, detail_json
+                        )
+                        VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            alert_id,
+                            node_id,
+                            metric,
+                            threshold,
+                            value,
+                            now,
+                            now,
+                            json.dumps(detail, ensure_ascii=True),
+                        ),
+                    )
+                    alert = self._alert_by_id(alert_id)
+                    if alert:
+                        events.append({"type": "alert_created", "alert": alert})
+                elif active:
+                    self._conn.execute(
+                        """
+                        UPDATE alerts
+                        SET status = 'resolved',
+                            threshold = ?,
+                            value = ?,
+                            resolved_at = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (threshold, value, now, now, active["id"]),
+                    )
+                    alert = self._alert_by_id(active["id"])
+                    if alert:
+                        events.append({"type": "alert_resolved", "alert": alert})
+        return events
+
+    def _alert_by_id(self, alert_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+        return _alert_row_to_dict(row) if row else None
+
     def replace_inventory(self, node_id: str, containers: list[dict[str, Any]]) -> None:
         now = utc_now()
         seen_ids = [str(item.get("id") or item.get("container_id")) for item in containers if item.get("id") or item.get("container_id")]
@@ -482,6 +824,36 @@ class Database:
                 (now, now, command_id),
             )
 
+    def mark_command_acknowledged(self, command_id: str, node_id: str) -> dict[str, Any] | None:
+        now = utc_now()
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE commands
+                SET status = 'acknowledged', acknowledged_at = ?, updated_at = ?
+                WHERE id = ? AND node_id = ? AND status IN ('pending', 'sent')
+                """,
+                (now, now, command_id, node_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_command(command_id)
+
+    def mark_command_running(self, command_id: str, node_id: str) -> dict[str, Any] | None:
+        now = utc_now()
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE commands
+                SET status = 'running', running_at = ?, updated_at = ?
+                WHERE id = ? AND node_id = ? AND status IN ('pending', 'sent', 'acknowledged')
+                """,
+                (now, now, command_id, node_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_command(command_id)
+
     def mark_command_result(
         self,
         command_id: str,
@@ -495,7 +867,7 @@ class Database:
                 """
                 UPDATE commands
                 SET status = ?, result_message = ?, finished_at = ?, updated_at = ?
-                WHERE id = ? AND node_id = ?
+                WHERE id = ? AND node_id = ? AND status IN ('pending', 'sent', 'acknowledged', 'running')
                 """,
                 (status, message, now, now, command_id, node_id),
             )
@@ -607,18 +979,107 @@ class Database:
             ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
+    def rollup_metrics(self) -> dict[str, int]:
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                """
+                SELECT *
+                FROM metrics
+                ORDER BY node_id ASC, captured_at ASC
+                """
+            ).fetchall()
+            raw_rows = [_row_to_dict(row) for row in rows]
+            hourly = self._upsert_rollups("metrics_hourly", raw_rows, "hour")
+            daily = self._upsert_rollups("metrics_daily", raw_rows, "day")
+        return {"hourly": hourly, "daily": daily}
+
+    def _upsert_rollups(self, table: str, rows: list[dict[str, Any]], bucket: str) -> int:
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            captured_at = _parse_utc(str(row.get("captured_at") or ""))
+            node_id = str(row.get("node_id") or "")
+            if captured_at is None or not node_id:
+                continue
+            normalized = dict(row)
+            normalized["captured_at"] = captured_at.isoformat(timespec="seconds")
+            bucket_start = _bucket_start(captured_at, bucket).isoformat(timespec="seconds")
+            grouped.setdefault((node_id, bucket_start), []).append(normalized)
+
+        now = utc_now()
+        for (node_id, bucket_start), bucket_rows in grouped.items():
+            record = _rollup_record(node_id, bucket_start, bucket_rows, bucket, now)
+            self._conn.execute(
+                f"""
+                INSERT INTO {table} (
+                    node_id, bucket_start, bucket_end, sample_count,
+                    cpu_avg, cpu_max, cpu_peak_at,
+                    memory_avg, memory_max, memory_peak_at,
+                    disk_avg, disk_max, disk_peak_at,
+                    load1, load5, load15, net_rx, net_tx, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(node_id, bucket_start) DO UPDATE SET
+                    bucket_end = excluded.bucket_end,
+                    sample_count = excluded.sample_count,
+                    cpu_avg = excluded.cpu_avg,
+                    cpu_max = excluded.cpu_max,
+                    cpu_peak_at = excluded.cpu_peak_at,
+                    memory_avg = excluded.memory_avg,
+                    memory_max = excluded.memory_max,
+                    memory_peak_at = excluded.memory_peak_at,
+                    disk_avg = excluded.disk_avg,
+                    disk_max = excluded.disk_max,
+                    disk_peak_at = excluded.disk_peak_at,
+                    load1 = excluded.load1,
+                    load5 = excluded.load5,
+                    load15 = excluded.load15,
+                    net_rx = excluded.net_rx,
+                    net_tx = excluded.net_tx,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    record["node_id"],
+                    record["bucket_start"],
+                    record["bucket_end"],
+                    record["sample_count"],
+                    record["cpu_avg"],
+                    record["cpu_max"],
+                    record["cpu_peak_at"],
+                    record["memory_avg"],
+                    record["memory_max"],
+                    record["memory_peak_at"],
+                    record["disk_avg"],
+                    record["disk_max"],
+                    record["disk_peak_at"],
+                    record["load1"],
+                    record["load5"],
+                    record["load15"],
+                    record["net_rx"],
+                    record["net_tx"],
+                    record["updated_at"],
+                ),
+            )
+        return len(grouped)
+
     def list_metric_series(self, node_id: str, range_name: str = "1h") -> dict[str, Any]:
         config = {
-            "1h": {"duration": timedelta(hours=1), "bucket": "raw", "limit": 1000},
-            "7d": {"duration": timedelta(days=7), "bucket": "hour", "limit": 200000},
-            "30d": {"duration": timedelta(days=30), "bucket": "day", "limit": 750000},
+            "1h": {"duration": timedelta(hours=1), "bucket": "raw", "limit": 1000, "table": ""},
+            "7d": {"duration": timedelta(days=7), "bucket": "hour", "limit": 200000, "table": "metrics_hourly"},
+            "30d": {"duration": timedelta(days=30), "bucket": "day", "limit": 750000, "table": "metrics_daily"},
         }.get(range_name)
         if not config:
             range_name = "1h"
-            config = {"duration": timedelta(hours=1), "bucket": "raw", "limit": 1000}
+            config = {"duration": timedelta(hours=1), "bucket": "raw", "limit": 1000, "table": ""}
 
         now = datetime.now(timezone.utc)
         start = now - config["duration"]
+        bucket = str(config["bucket"])
+        table = str(config["table"])
+        if table:
+            rollup_payload = self._list_rollup_metric_series(node_id, range_name, bucket, table, start, now)
+            if rollup_payload is not None:
+                return rollup_payload
+
         with self._lock:
             rows = self._conn.execute(
                 """
@@ -640,15 +1101,47 @@ class Database:
             row["captured_at"] = captured_at.isoformat(timespec="seconds")
             parsed_rows.append(row)
 
-        bucket = str(config["bucket"])
         points = _raw_metric_points(parsed_rows) if bucket == "raw" else _aggregate_metric_points(parsed_rows, bucket)
         return {
             "range": range_name,
             "bucket": bucket,
+            "source": "raw",
             "from": start.isoformat(timespec="seconds"),
             "to": now.isoformat(timespec="seconds"),
             "points": points,
             "summary": _metric_summary(parsed_rows),
+        }
+
+    def _list_rollup_metric_series(
+        self,
+        node_id: str,
+        range_name: str,
+        bucket: str,
+        table: str,
+        start: datetime,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT *
+                FROM {table}
+                WHERE node_id = ? AND bucket_start >= ?
+                ORDER BY bucket_start ASC
+                """,
+                (node_id, start.isoformat(timespec="seconds")),
+            ).fetchall()
+        if not rows:
+            return None
+        points = _rollup_metric_points([_row_to_dict(row) for row in rows])
+        return {
+            "range": range_name,
+            "bucket": bucket,
+            "source": "rollup",
+            "from": start.isoformat(timespec="seconds"),
+            "to": now.isoformat(timespec="seconds"),
+            "points": points,
+            "summary": _metric_summary_from_points(points),
         }
 
     def list_containers(self, node_id: str | None = None) -> list[dict[str, Any]]:
@@ -688,13 +1181,59 @@ class Database:
             items.append(item)
         return items
 
-    def list_audit_logs(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_audit_logs(
+        self,
+        limit: int = 100,
+        node_id: str | None = None,
+        action: str | None = None,
+        from_time: str | None = None,
+        to_time: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM audit_logs"
+        conditions: list[str] = []
+        params: list[Any] = []
+        if node_id:
+            conditions.append("node_id = ?")
+            params.append(node_id)
+        if action:
+            conditions.append("(action = ? OR event_type = ?)")
+            params.extend([action, action])
+        if from_time:
+            conditions.append("created_at >= ?")
+            params.append(from_time)
+        if to_time:
+            conditions.append("created_at <= ?")
+            params.append(to_time)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_dict(row) for row in rows]
+
+    def list_alerts(
+        self,
+        limit: int = 100,
+        status: str | None = None,
+        node_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM alerts"
+        conditions: list[str] = []
+        params: list[Any] = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if node_id:
+            conditions.append("node_id = ?")
+            params.append(node_id)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY triggered_at DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_alert_row_to_dict(row) for row in rows]
 
     def update_stale_node_statuses(self, warning_after_seconds: int, offline_after_seconds: int) -> list[dict[str, Any]]:
         now = datetime.now(timezone.utc)
@@ -726,30 +1265,49 @@ class Database:
     def expire_stale_commands(self, timeout_seconds: int) -> list[dict[str, Any]]:
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(seconds=max(0, timeout_seconds))
-        expired_ids: list[str] = []
+        expired: list[tuple[str, str]] = []
         with self._lock, self._conn:
             rows = self._conn.execute(
                 """
-                SELECT id FROM commands
-                WHERE status IN ('pending', 'sent') AND created_at <= ?
+                SELECT id, status FROM commands
+                WHERE status IN ('pending', 'sent', 'acknowledged', 'running') AND created_at <= ?
                 """,
                 (cutoff.isoformat(timespec="seconds"),),
             ).fetchall()
-            expired_ids = [row["id"] for row in rows]
-            if expired_ids:
-                placeholders = ",".join("?" for _ in expired_ids)
-                self._conn.execute(
-                    f"""
-                    UPDATE commands
-                    SET status = 'timeout',
-                        result_message = 'agent did not acknowledge in time',
-                        finished_at = ?,
-                        updated_at = ?
-                    WHERE id IN ({placeholders})
-                    """,
-                    [utc_now(), utc_now(), *expired_ids],
-                )
-        return [command for command_id in expired_ids if (command := self.get_command(command_id))]
+            expired = [(row["id"], row["status"]) for row in rows]
+            if expired:
+                now_text = utc_now()
+                unacked_ids = [command_id for command_id, status in expired if status in {"pending", "sent"}]
+                unfinished_ids = [
+                    command_id for command_id, status in expired if status in {"acknowledged", "running"}
+                ]
+                if unacked_ids:
+                    placeholders = ",".join("?" for _ in unacked_ids)
+                    self._conn.execute(
+                        f"""
+                        UPDATE commands
+                        SET status = 'timeout',
+                            result_message = 'agent did not acknowledge in time',
+                            finished_at = ?,
+                            updated_at = ?
+                        WHERE id IN ({placeholders})
+                        """,
+                        [now_text, now_text, *unacked_ids],
+                    )
+                if unfinished_ids:
+                    placeholders = ",".join("?" for _ in unfinished_ids)
+                    self._conn.execute(
+                        f"""
+                        UPDATE commands
+                        SET status = 'timeout',
+                            result_message = 'agent did not finish in time',
+                            finished_at = ?,
+                            updated_at = ?
+                        WHERE id IN ({placeholders})
+                        """,
+                        [now_text, now_text, *unfinished_ids],
+                    )
+        return [command for command_id, _ in expired if (command := self.get_command(command_id))]
 
     def prune_metrics(self, raw_metrics_days: int) -> int:
         if raw_metrics_days <= 0:
@@ -758,6 +1316,23 @@ class Database:
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 "DELETE FROM metrics WHERE captured_at < ?",
+                (cutoff.isoformat(timespec="seconds"),),
+            )
+            return int(cursor.rowcount or 0)
+
+    def prune_rollups(self, hourly_days: int, daily_days: int) -> dict[str, int]:
+        return {
+            "hourly": self._prune_rollup_table("metrics_hourly", hourly_days),
+            "daily": self._prune_rollup_table("metrics_daily", daily_days),
+        }
+
+    def _prune_rollup_table(self, table: str, days: int) -> int:
+        if days <= 0:
+            return 0
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                f"DELETE FROM {table} WHERE bucket_start < ?",
                 (cutoff.isoformat(timespec="seconds"),),
             )
             return int(cursor.rowcount or 0)

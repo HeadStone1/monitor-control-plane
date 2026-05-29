@@ -4,9 +4,23 @@
 
 ### Security
 
-- Added PBKDF2 password hashing support through `admin_password_hash`.
-- Added per-node Agent credentials through `agents[].node_id` and `agents[].token_hash`.
+- Added Argon2id password hashing support through `admin_password_hash`; plaintext admin passwords and legacy PBKDF2 hashes are rejected.
+- Added per-node Agent credentials through `agents[].node_id` and required Argon2id `agents[].token_hash`; plaintext Agent token config is rejected.
 - Changed Agent authentication so a valid token can only claim its configured node ID.
+- Added runtime config reload for users, roles, API tokens, and Agent credentials.
+- Added runtime Agent token revoke API that disables the in-memory credential and disconnects the current Agent connection.
+- Added command ACK/running states and state-aware command timeout messages.
+- Added server-side metric thresholds, active/resolved alerts, and WebUI alert count display.
+- Added hourly/daily metrics rollup tables and long-range query routing to rollup data.
+- Added audit log filtering and WebUI CSV export.
+- Added deployment examples for systemd Server/Agent services, daily SQLite backups, Docker images, and Docker Compose.
+- Added a WebUI node overview dashboard with per-node CPU, memory, disk rings, status, and alert count.
+- Added container list search and running/stopped status filters.
+- Added WebUI RBAC awareness so read-only users no longer see active container command controls or threshold editors.
+- Added WebUI dark mode with persisted preference and chart colors driven by theme variables.
+- Added Canvas chart drag-to-zoom with a reset control for narrowing metric time ranges.
+- Added an authenticated Prometheus `/metrics` endpoint for latest node status and utilization gauges.
+- Added Dependabot monitoring for Python dependencies and GitHub Actions.
 - Added production startup checks that refuse development defaults, plaintext secrets, insecure cookies, and missing secure-transport enforcement.
 - Added login and WebSocket authentication failure rate limiting.
 - Added Agent payload limits for container inventory/stat messages and command result text.

@@ -11,6 +11,12 @@ Restart=always
 RestartSec=5
 User=monitor
 Group=monitor
+SupplementaryGroups=docker
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/monitor
 
 [Install]
 WantedBy=multi-user.target

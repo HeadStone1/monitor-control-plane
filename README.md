@@ -67,9 +67,9 @@ WebUI 支持按时间范围查看节点指标：
 - 近 7 天：按小时聚合，折线展示每小时平均值，悬浮提示展示平均值、最高值和峰值时间。
 - 近 30 天：按天聚合，折线展示每日平均值，悬浮提示展示平均值、最高值和峰值时间。
 
-当前版本保留原始指标数据，查询时动态聚合。数据量增大后，建议新增小时/天级汇总表或后台定时 rollup 任务，避免长时间范围查询扫描过多原始数据。
+Server 会保留原始指标数据，并定时写入 `metrics_hourly` / `metrics_daily` 汇总表。`1h` 查询读取原始数据，`7d` 优先读取小时汇总，`30d` 优先读取天汇总；如果汇总尚未生成，会自动回退到原始数据动态聚合。
 
-WebUI 还支持本地设置 CPU、Memory、Disk 安全阈值，并在图表中显示对应虚线红线/界限。当前阈值存储在浏览器本地，后续可改为服务端持久化并用于告警规则。
+WebUI 支持设置 CPU、Memory、Disk 安全阈值，并在图表中显示对应虚线界限。阈值会持久化在 Server 侧，Agent 上报指标后由 Server 评估告警，WebUI 顶部会显示当前告警数量。
 
 ## 安全设计现状
 
@@ -86,7 +86,7 @@ WebUI 还支持本地设置 CPU、Memory、Disk 安全阈值，并在图表中�
 - Agent 侧再次校验动作白名单和容器 ID 格式。
 - 危险容器操作写入审计日志。
 - 真实配置文件不应提交到 Git，仓库只保留 `*.example.yaml`。
-- 管理员密码支持 `admin_password_hash`，不需要在服务端配置中保存明文密码。
+- 管理员密码仅支持 `admin_password_hash`，不允许在服务端配置中保存明文密码。
 - Agent token 支持 `token_hash`，并绑定到具体 `node_id`。
 - 非本机 `ws://` Agent 连接默认被拒绝，生产模式要求安全传输和 Secure Cookie。
 - 登录和 WebSocket 认证失败有基础限速，Agent 容器清单/状态消息有数量上限。
@@ -94,8 +94,8 @@ WebUI 还支持本地设置 CPU、Memory、Disk 安全阈值，并在图表中�
 仍需加强：
 
 - Agent token 轮换/吊销流程和更细粒度审计。
-- 更强密码哈希方案，例如 Argon2id/bcrypt，或对 PBKDF2 参数做可配置升级。
-- 增加 CSRF token、命令 ACK/超时、RBAC、审计查询和告警。
+- 更完整的 Agent token 运行时热重载、吊销 API 和轮换流程。
+- 增加命令 ACK 状态机、RBAC、审计筛选导出和服务端告警。
 - 增加依赖漏洞扫描、自动化浏览器安全测试和发布流程。
 - 为 Server/Agent 制作 systemd、Docker、升级、回滚和备份方案。
 
@@ -128,7 +128,7 @@ Copy-Item agent.example.yaml agent.yaml
 .\.venv\Scripts\python.exe -m server.monitor_server --hash-secret "your-agent-token"
 ```
 
-这条命令会打印 PBKDF2 哈希。把打印结果分别填入 `admin_password_hash` 和 `agents[].token_hash`。
+这条命令会打印 Argon2id 哈希。把打印结果分别填入 `admin_password_hash` 和 `agents[].token_hash`。旧版 PBKDF2 hash 不再接受，升级后需要一次性重新生成并替换配置里的 hash。
 
 ```yaml
 allowed_hosts:
@@ -183,10 +183,8 @@ Server 支持用环境变量覆盖敏感配置：
 MONITOR_ADMIN_TOKEN
 MONITOR_ADMIN_USERNAME
 MONITOR_ADMIN_PASSWORD_HASH
-MONITOR_ADMIN_PASSWORD
 MONITOR_SESSION_SECRET
 MONITOR_SESSION_TTL_HOURS
-MONITOR_AGENT_TOKENS
 MONITOR_ALLOWED_HOSTS
 MONITOR_DATABASE_PATH
 MONITOR_HOST
@@ -197,10 +195,10 @@ MONITOR_TRUST_PROXY_HEADERS
 MONITOR_REQUIRE_SECURE_TRANSPORT
 ```
 
-`MONITOR_AGENT_TOKENS` 是兼容旧配置的开发回退方式，会绑定到 `dev-agent` / `legacy-agent-*`；生产环境应使用 `agents[].token_hash`。`MONITOR_ALLOWED_HOSTS` 支持逗号分隔：
+`MONITOR_AGENT_TOKENS` is no longer supported. The Server does not accept plaintext Agent tokens; use `agents[].token_hash`. `MONITOR_ALLOWED_HOSTS` supports comma-separated values:
 
 ```text
-token-a,token-b,token-c
+monitor.example.com,127.0.0.1,localhost
 ```
 
 ## 生产前必须修改
@@ -210,9 +208,49 @@ token-a,token-b,token-c
 - 把 `allowed_hosts` 改成你的真实域名或内网 IP。
 - 将 Server 绑定到内网地址或放在反向代理后。
 - 限制 WebUI 访问来源，例如 VPN、堡垒机、内网网段。
-- 让 Agent 以最小权限运行，并谨慎授予 Docker socket 访问权。
-- 配置日志轮转和数据库备份。
+- 让 Agent 以最小权限运行，并谨慎授予 Docker socket 访问权；优先考虑 Rootless Docker，或使用 Docker API over TLS + 授权代理限制可调用 API。
+- 配置日志轮转和数据库备份；SQLite 默认启用 WAL，建议每天备份 `data/monitor.db`。
 - 定期更新依赖、Python、Docker 和操作系统补丁。
+
+## 数据库备份
+
+Server 使用 SQLite，默认数据库路径是 `data/monitor.db`。建议在停机窗口或低峰期定期备份：
+
+```powershell
+.\scripts\backup_sqlite.ps1
+```
+
+脚本会调用 SQLite CLI 的 `.backup` 命令，把数据库备份到 `backups/monitor-YYYYMMDD-HHMMSS.db`。恢复时先停止 Server，再用备份文件替换当前数据库文件。
+
+## Deployment
+
+Deployment-ready examples are included:
+
+- `deploy/systemd/monitor-server.service`
+- `deploy/systemd/monitor-agent.service`
+- `deploy/systemd/monitor-db-backup.service`
+- `deploy/systemd/monitor-db-backup.timer`
+- `Dockerfile`
+- `docker-compose.yml`
+- `scripts/backup_sqlite.sh`
+
+See `docs/deployment.md` for systemd, Docker Compose, SQLite backup, and Docker socket hardening notes.
+
+## Prometheus
+
+The Server exposes a Prometheus text endpoint at `/metrics`. It requires
+`metrics:read`, so use a scoped API token instead of anonymous scraping:
+
+```yaml
+api_tokens:
+  - name: prometheus
+    token_hash: replace-with-generated-token-hash
+    scopes:
+      - metrics:read
+    enabled: true
+```
+
+Then configure Prometheus with a Bearer token for the scrape target.
 
 ## License
 
@@ -228,11 +266,20 @@ See [LICENSE](LICENSE) for details.
 
 The current security baseline is stricter than the initial MVP:
 
-- Admin login supports `admin_password_hash`; generate it with `python -m server.monitor_server --hash-secret "your-password"`.
-- Plaintext `admin_password` is kept only as a local-development fallback and is refused in production or non-loopback binds.
+- Admin login only supports `admin_password_hash`; generate it with `python -m server.monitor_server --hash-secret "your-password"`.
+- Plaintext `admin_password`, `users[].password`, and `MONITOR_ADMIN_PASSWORD` are rejected at config load time.
+- Password and token hashes must be Argon2id. Legacy PBKDF2 hashes and plaintext Agent token fields are rejected; regenerate hashes with `--hash-secret` during upgrade.
 - Agent credentials are bound to specific node IDs through the `agents` config list.
 - A leaked token for one Agent can no longer claim an arbitrary `agent_id`.
-- Agent token hashes are supported through `token_hash`; plaintext Agent tokens are only accepted as a local-development fallback.
+- Agent token hashes are required through `token_hash`; `agent_tokens`, `MONITOR_AGENT_TOKENS`, and `agents[].token` are rejected.
+- Admins can reload runtime auth config with `POST /api/admin/config/reload`; Linux deployments can also send `SIGHUP`.
+- Admins can revoke an Agent at runtime with `POST /api/admin/agents/{node_id}/revoke`, which disables the in-memory credential and disconnects the current Agent WebSocket.
+- Runtime revoke does not rewrite `server.yaml`; persist revocation by setting the matching `agents[].enabled: false` in config, then reload.
+- Container commands now report `sent`, `acknowledged`, `running`, `success`, `failed`, or `timeout`; timeout messages distinguish commands that were never acknowledged from commands that started but did not finish.
+- Metrics rollup stores hourly and daily summaries, and long-range queries prefer those summaries before falling back to raw metrics.
+- Threshold settings are stored on the Server and drive active/resolved alert events pushed to WebUI.
+- Audit logs can be filtered by node, action, and time range, and the current WebUI result set can be exported as CSV.
+- Metric charts support drag-to-zoom selection and reset without adding a frontend framework.
 - Production mode requires `secure_cookies: true` and `require_secure_transport: true`.
 - Non-loopback Agent `ws://` connections are blocked unless explicitly opted in with `allow_insecure_transport: true`.
 - Login and WebSocket authentication failures are rate limited.

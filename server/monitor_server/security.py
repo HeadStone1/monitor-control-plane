@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from fastapi import HTTPException, Request, Response, status
 
 from .config import AgentCredential, ApiTokenConfig, ServerConfig, UserConfig
@@ -16,9 +18,16 @@ from .config import AgentCredential, ApiTokenConfig, ServerConfig, UserConfig
 
 TOKEN_PREFIX = "monitor"
 SESSION_COOKIE_NAME = "monitor_session"
-SECRET_HASH_PREFIX = "pbkdf2_sha256"
-DEFAULT_SECRET_HASH_ITERATIONS = 310_000
+ARGON2_HASH_PREFIX = "$argon2id$"
 CSRF_HEADER_NAME = "x-csrf-token"
+
+_ARGON2_HASHER = PasswordHasher(
+    time_cost=3,
+    memory_cost=65536,
+    parallelism=2,
+    hash_len=32,
+    salt_len=16,
+)
 
 
 @dataclass(slots=True)
@@ -38,38 +47,27 @@ def _b64decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + padding)
 
 
-def hash_secret(secret: str, *, iterations: int = DEFAULT_SECRET_HASH_ITERATIONS) -> str:
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, iterations)
-    return f"{SECRET_HASH_PREFIX}${iterations}${_b64encode(salt)}${_b64encode(digest)}"
+def hash_secret(secret: str) -> str:
+    return _ARGON2_HASHER.hash(secret)
 
 
 def is_secret_hash(encoded: str) -> bool:
-    parts = encoded.split("$")
-    if len(parts) != 4 or parts[0] != SECRET_HASH_PREFIX:
+    if not encoded.startswith(ARGON2_HASH_PREFIX):
         return False
     try:
-        int(parts[1])
-        _b64decode(parts[2])
-        _b64decode(parts[3])
-    except (ValueError, TypeError):
+        _ARGON2_HASHER.check_needs_rehash(encoded)
+    except (InvalidHashError, VerificationError, ValueError, TypeError):
         return False
     return True
 
 
 def verify_secret(secret: str, encoded: str) -> bool:
-    if not is_secret_hash(encoded):
+    if not encoded.startswith(ARGON2_HASH_PREFIX):
         return False
-    parts = encoded.split("$")
     try:
-        iterations = int(parts[1])
-        salt = _b64decode(parts[2])
-        expected = _b64decode(parts[3])
-    except (ValueError, TypeError):
+        return _ARGON2_HASHER.verify(encoded, secret)
+    except (InvalidHashError, VerificationError, VerifyMismatchError, ValueError, TypeError):
         return False
-
-    digest = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, iterations)
-    return hmac.compare_digest(digest, expected)
 
 
 def extract_bearer_token(value: str | None) -> str | None:
@@ -108,8 +106,6 @@ def verify_admin_password(config: ServerConfig, username: str, password: str) ->
         return False
     if user.password_hash:
         return verify_secret(password, user.password_hash)
-    if user.password:
-        return hmac.compare_digest(password, user.password)
     return False
 
 
@@ -117,11 +113,10 @@ def find_user(config: ServerConfig, username: str) -> UserConfig | None:
     for user in config.users:
         if user.enabled and hmac.compare_digest(username, user.username):
             return user
-    if hmac.compare_digest(username, config.admin_username) and (config.admin_password_hash or config.admin_password):
+    if hmac.compare_digest(username, config.admin_username) and config.admin_password_hash:
         return UserConfig(
             username=config.admin_username,
             password_hash=config.admin_password_hash,
-            password=config.admin_password,
             role="admin",
         )
     return None
@@ -135,8 +130,6 @@ def verify_agent_credentials(config: ServerConfig, node_id: str, token: str) -> 
         if not agent.enabled or not hmac.compare_digest(node_id, agent.node_id):
             continue
         if agent.token_hash and verify_secret(token, agent.token_hash):
-            return agent
-        if agent.token and hmac.compare_digest(token, agent.token):
             return agent
     return None
 

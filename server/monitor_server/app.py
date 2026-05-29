@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
+import hashlib
 import logging
 from pathlib import Path
+import signal
 import time
 from typing import Any
 
@@ -10,10 +13,10 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, W
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .config import DEV_ADMIN_PASSWORD_HASH, DEV_AGENT_TOKEN_HASH, ServerConfig
+from .config import AgentCredential, DEV_ADMIN_PASSWORD_HASH, DEV_AGENT_TOKEN_HASH, ServerConfig, load_server_config
 from .db import Database
 from .hub import ConnectionHub
 from .security import (
@@ -91,6 +94,21 @@ class CommandResultPayload(BaseModel):
     command_id: str = Field(min_length=1, max_length=80)
     status: str = Field(pattern=r"^(success|failed)$")
     message: str | None = Field(default=None, max_length=4096)
+
+
+class CommandStatePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    command_id: str = Field(min_length=1, max_length=80)
+    message: str | None = Field(default=None, max_length=4096)
+
+
+class ThresholdSettingsPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cpu: float | None = Field(default=None, ge=0, le=100)
+    memory: float | None = Field(default=None, ge=0, le=100)
+    disk: float | None = Field(default=None, ge=0, le=100)
 
 
 class LoginPayload(BaseModel):
@@ -176,6 +194,8 @@ def create_app(config: ServerConfig) -> FastAPI:
     app.state.db = Database(config.database_path)
     app.state.hub = ConnectionHub()
     app.state.status_task = None
+    app.state.reload_lock = asyncio.Lock()
+    app.state.last_rollup_at = 0.0
     app.state.login_limiter = FailureRateLimiter(
         config.auth_rate_limit.window_seconds,
         config.auth_rate_limit.login_max_failures,
@@ -190,6 +210,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         _validate_startup_security(config)
         app.state.db.init()
         app.state.status_task = asyncio.create_task(_status_watcher(app))
+        _install_sighup_reload(app)
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
@@ -245,6 +266,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         limiter.reset(rate_key)
         token, expires_at = create_session_token(config, username)
         csrf_token = extract_csrf_token(config, token)
+        context = verify_auth_context(config, token, allow_static_admin_token=False)
         set_session_cookie(
             response,
             token,
@@ -262,6 +284,8 @@ def create_app(config: ServerConfig) -> FastAPI:
             "csrf_token": csrf_token,
             "expires_at": expires_at,
             "username": username,
+            "role": context.role if context else "",
+            "scopes": context.scopes if context else [],
         }
 
     @app.post("/api/auth/logout")
@@ -270,9 +294,9 @@ def create_app(config: ServerConfig) -> FastAPI:
         return {"status": "signed_out"}
 
     @app.get("/api/auth/me")
-    async def me(request: Request, auth: AuthContext = Depends(require_permission("nodes:read"))) -> dict[str, str]:
+    async def me(request: Request, auth: AuthContext = Depends(require_permission("nodes:read"))) -> dict[str, Any]:
         csrf_token = extract_csrf_token(config, request.cookies.get(SESSION_COOKIE_NAME))
-        return {"username": auth.actor, "role": auth.role, "csrf_token": csrf_token or ""}
+        return {"username": auth.actor, "role": auth.role, "scopes": auth.scopes, "csrf_token": csrf_token or ""}
 
     @app.get("/api/nodes")
     async def list_nodes(_: AuthContext = Depends(require_permission("nodes:read"))) -> list[dict[str, Any]]:
@@ -287,6 +311,50 @@ def create_app(config: ServerConfig) -> FastAPI:
         if metric_range not in {"1h", "7d", "30d"}:
             raise HTTPException(status_code=400, detail="unsupported metric range")
         return app.state.db.list_metric_series(node_id, range_name=metric_range)
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def prometheus_metrics(_: AuthContext = Depends(require_permission("metrics:read"))) -> PlainTextResponse:
+        return PlainTextResponse(
+            _prometheus_metrics(app.state.db.list_nodes()),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    @app.get("/api/settings/thresholds")
+    async def get_thresholds(_: AuthContext = Depends(require_permission("metrics:read"))) -> dict[str, Any]:
+        thresholds, configured = app.state.db.get_thresholds()
+        return {"thresholds": thresholds, "configured": configured}
+
+    @app.put("/api/settings/thresholds")
+    async def put_thresholds(
+        request: Request,
+        auth: AuthContext = Depends(require_permission("*")),
+    ) -> dict[str, Any]:
+        try:
+            payload = ThresholdSettingsPayload.model_validate(await request.json())
+        except (ValueError, ValidationError):
+            raise HTTPException(status_code=400, detail="invalid threshold payload")
+        thresholds = app.state.db.set_thresholds(payload.model_dump())
+        app.state.db.add_security_event(
+            event_type="thresholds_updated",
+            actor=auth.actor,
+            client_ip=_client_host(request),
+            user_agent=request.headers.get("user-agent"),
+            result="accepted",
+            detail={"thresholds": thresholds},
+        )
+        await app.state.hub.broadcast_ui({"type": "thresholds_updated", "thresholds": thresholds})
+        return {"thresholds": thresholds}
+
+    @app.get("/api/alerts")
+    async def list_alerts(
+        limit: int = 100,
+        status_filter: str | None = Query(None, alias="status"),
+        node_id: str | None = None,
+        _: AuthContext = Depends(require_permission("metrics:read")),
+    ) -> list[dict[str, Any]]:
+        if status_filter and status_filter not in {"active", "resolved"}:
+            raise HTTPException(status_code=400, detail="unsupported alert status")
+        return app.state.db.list_alerts(limit=max(1, min(limit, 500)), status=status_filter, node_id=node_id)
 
     @app.get("/api/containers")
     async def list_containers(
@@ -305,9 +373,67 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.get("/api/audit-logs")
     async def list_audit_logs(
         limit: int = 100,
+        node_id: str | None = None,
+        action: str | None = None,
+        from_time: str | None = Query(None, alias="from"),
+        to_time: str | None = Query(None, alias="to"),
         _: AuthContext = Depends(require_permission("audit:read")),
     ) -> list[dict[str, Any]]:
-        return app.state.db.list_audit_logs(limit=max(1, min(limit, 500)))
+        return app.state.db.list_audit_logs(
+            limit=max(1, min(limit, 500)),
+            node_id=node_id or None,
+            action=action or None,
+            from_time=from_time or None,
+            to_time=to_time or None,
+        )
+
+    @app.post("/api/admin/config/reload")
+    async def reload_config(
+        request: Request,
+        auth: AuthContext = Depends(require_permission("*")),
+    ) -> dict[str, Any]:
+        try:
+            return await _reload_runtime_config(
+                app,
+                actor=auth.actor,
+                client_ip=_client_host(request),
+                user_agent=request.headers.get("user-agent"),
+            )
+        except (RuntimeError, ValueError) as exc:
+            app.state.db.add_security_event(
+                event_type="config_reload_failed",
+                actor=auth.actor,
+                client_ip=_client_host(request),
+                user_agent=request.headers.get("user-agent"),
+                result="rejected",
+                detail={"error": str(exc)},
+            )
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/admin/agents/{node_id}/revoke")
+    async def revoke_agent(
+        node_id: str,
+        request: Request,
+        auth: AuthContext = Depends(require_permission("*")),
+    ) -> dict[str, Any]:
+        result = await _revoke_agent_runtime(
+            app,
+            node_id,
+            actor=auth.actor,
+            client_ip=_client_host(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+        if result is None:
+            app.state.db.add_security_event(
+                event_type="agent_token_revoke_failed",
+                actor=auth.actor,
+                client_ip=_client_host(request),
+                user_agent=request.headers.get("user-agent"),
+                node_id=node_id,
+                result="not_found",
+            )
+            raise HTTPException(status_code=404, detail="agent credential not found")
+        return result
 
     @app.post("/api/nodes/{node_id}/commands")
     async def create_command(
@@ -337,7 +463,7 @@ def create_app(config: ServerConfig) -> FastAPI:
             result="created",
         )
 
-        sent = await app.state.hub.send_command(node_id, command)
+        sent = await app.state.hub.send_command(node_id, command, timeout_seconds=config.command.timeout_seconds)
         if sent:
             app.state.db.mark_command_sent(command["id"])
             command = app.state.db.get_command(command["id"])
@@ -397,7 +523,11 @@ def create_app(config: ServerConfig) -> FastAPI:
 
         limiter.reset(rate_key)
         agent_name = credential.name or str(auth.get("agent_name") or node_id)
-        registered = await app.state.hub.register_agent(node_id, websocket)
+        registered = await app.state.hub.register_agent(
+            node_id,
+            websocket,
+            credential_fingerprint=_agent_credential_fingerprint(credential),
+        )
         if not registered:
             app.state.db.add_security_event(
                 event_type="agent_duplicate_connection",
@@ -502,40 +632,39 @@ def _validate_startup_security(config: ServerConfig) -> None:
     }
     strict_mode = config.environment.lower() == "production" or not _is_loopback_host(config.host)
     weak: list[str] = []
+    invalid_hashes: list[str] = []
     for key, weak_value in weak_values.items():
         if getattr(config, key) == weak_value:
             weak.append(key)
-    if config.admin_password == "dev-admin-password" or config.admin_password_hash == DEV_ADMIN_PASSWORD_HASH:
+    if config.admin_password_hash == DEV_ADMIN_PASSWORD_HASH:
         weak.append("admin_password_hash")
-    has_user_password = any(user.enabled and (user.password_hash or user.password) for user in config.users)
-    if not config.admin_password_hash and not config.admin_password and not has_user_password:
+    has_user_password = any(user.enabled and user.password_hash for user in config.users)
+    if not config.admin_password_hash and not has_user_password:
         weak.append("admin_password_missing")
     if config.admin_password_hash and not is_secret_hash(config.admin_password_hash):
-        weak.append("invalid_admin_password_hash")
-    if any(agent.token == "dev-agent-token" or agent.token_hash == DEV_AGENT_TOKEN_HASH for agent in config.agents):
+        invalid_hashes.append("invalid_admin_password_hash")
+    if any(agent.token_hash == DEV_AGENT_TOKEN_HASH for agent in config.agents):
         weak.append("agents")
     if not config.agents:
         weak.append("agents_missing")
-    if any(not agent.token and not agent.token_hash for agent in config.agents):
+    if any(not agent.token_hash for agent in config.agents):
         weak.append("agent_token_missing")
     if any(agent.token_hash and not is_secret_hash(agent.token_hash) for agent in config.agents):
-        weak.append("invalid_agent_token_hash")
-    if config.admin_password:
-        weak.append("plaintext_admin_password")
-    if any(user.password for user in config.users):
-        weak.append("plaintext_user_password")
+        invalid_hashes.append("invalid_agent_token_hash")
     if any(user.password_hash and not is_secret_hash(user.password_hash) for user in config.users):
-        weak.append("invalid_user_password_hash")
-    if any(agent.token for agent in config.agents):
-        weak.append("plaintext_agent_token")
+        invalid_hashes.append("invalid_user_password_hash")
     for key in ("admin_token", "session_secret"):
         value = str(getattr(config, key) or "")
         if key == "admin_token" and not value:
             continue
         if _looks_placeholder(value) or len(value) < 24:
             weak.append(key)
-    if any(_looks_placeholder(agent.token) for agent in config.agents):
-        weak.append("plaintext_agent_token")
+
+    if any(token.enabled and token.token_hash and not is_secret_hash(token.token_hash) for token in config.api_tokens):
+        invalid_hashes.append("invalid_api_token_hash")
+    if invalid_hashes:
+        joined = ", ".join(sorted(set(invalid_hashes)))
+        raise RuntimeError(f"Invalid security hash configuration: {joined}")
 
     if weak and strict_mode:
         joined = ", ".join(sorted(set(weak)))
@@ -549,8 +678,250 @@ def _validate_startup_security(config: ServerConfig) -> None:
         raise RuntimeError("Production mode requires require_secure_transport=true")
     if config.environment.lower() == "production" and config.admin_token:
         raise RuntimeError("admin_token is disabled in production")
-    if any(token.enabled and token.token_hash and not is_secret_hash(token.token_hash) for token in config.api_tokens):
-        raise RuntimeError("Invalid api token hash")
+
+
+def _install_sighup_reload(app: FastAPI) -> None:
+    if not hasattr(signal, "SIGHUP"):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(
+            signal.SIGHUP,
+            lambda: asyncio.create_task(_reload_runtime_config_from_signal(app)),
+        )
+    except (NotImplementedError, RuntimeError, ValueError):
+        return
+
+
+async def _reload_runtime_config_from_signal(app: FastAPI) -> None:
+    try:
+        await _reload_runtime_config(app, actor="signal")
+    except Exception as exc:  # pragma: no cover - defensive signal callback guard
+        LOGGER.exception("Failed to reload monitor config from SIGHUP")
+        if hasattr(app.state, "db"):
+            app.state.db.add_security_event(
+                event_type="config_reload_failed",
+                actor="signal",
+                result="rejected",
+                detail={"error": str(exc)},
+            )
+
+
+def _prometheus_metrics(nodes: list[dict[str, Any]]) -> str:
+    lines = [
+        "# HELP monitor_node_online Whether the monitor node is online.",
+        "# TYPE monitor_node_online gauge",
+        "# HELP monitor_node_cpu_percent Latest node CPU utilization percent.",
+        "# TYPE monitor_node_cpu_percent gauge",
+        "# HELP monitor_node_memory_percent Latest node memory utilization percent.",
+        "# TYPE monitor_node_memory_percent gauge",
+        "# HELP monitor_node_disk_percent Latest node disk utilization percent.",
+        "# TYPE monitor_node_disk_percent gauge",
+        "# HELP monitor_node_docker_available Whether Docker is available on the node.",
+        "# TYPE monitor_node_docker_available gauge",
+        "# HELP monitor_node_last_seen_timestamp_seconds Last agent heartbeat time as a Unix timestamp.",
+        "# TYPE monitor_node_last_seen_timestamp_seconds gauge",
+        "# HELP monitor_node_latest_metric_timestamp_seconds Latest metric capture time as a Unix timestamp.",
+        "# TYPE monitor_node_latest_metric_timestamp_seconds gauge",
+        "# HELP monitor_node_info Node metadata labels with a constant value of 1.",
+        "# TYPE monitor_node_info gauge",
+    ]
+
+    for node in nodes:
+        labels = _prometheus_labels(
+            {
+                "node_id": node.get("id"),
+                "name": node.get("name"),
+                "hostname": node.get("hostname"),
+            }
+        )
+        info_labels = _prometheus_labels(
+            {
+                "node_id": node.get("id"),
+                "name": node.get("name"),
+                "hostname": node.get("hostname"),
+                "ip": node.get("ip"),
+                "os": node.get("os"),
+                "arch": node.get("arch"),
+                "agent_version": node.get("agent_version"),
+                "docker_version": node.get("docker_version"),
+            }
+        )
+        lines.append(f"monitor_node_online{{{labels}}} {1 if node.get('status') == 'online' else 0}")
+        lines.append(f"monitor_node_info{{{info_labels}}} 1")
+        _append_prometheus_gauge(lines, "monitor_node_cpu_percent", labels, node.get("latest_cpu_percent"))
+        _append_prometheus_gauge(lines, "monitor_node_memory_percent", labels, node.get("latest_memory_percent"))
+        _append_prometheus_gauge(lines, "monitor_node_disk_percent", labels, node.get("latest_disk_percent"))
+        _append_prometheus_gauge(
+            lines,
+            "monitor_node_docker_available",
+            labels,
+            1 if node.get("docker_available") else 0,
+        )
+        _append_prometheus_gauge(
+            lines,
+            "monitor_node_last_seen_timestamp_seconds",
+            labels,
+            _timestamp_seconds(node.get("last_seen")),
+        )
+        _append_prometheus_gauge(
+            lines,
+            "monitor_node_latest_metric_timestamp_seconds",
+            labels,
+            _timestamp_seconds(node.get("latest_metric_at")),
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def _append_prometheus_gauge(lines: list[str], name: str, labels: str, value: Any) -> None:
+    if value is None:
+        return
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return
+    lines.append(f"{name}{{{labels}}} {number:g}")
+
+
+def _prometheus_labels(values: dict[str, Any]) -> str:
+    return ",".join(f'{key}="{_prometheus_label_value(value)}"' for key, value in values.items())
+
+
+def _prometheus_label_value(value: Any) -> str:
+    return str(value or "").replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def _timestamp_seconds(value: Any) -> float | None:
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+async def _reload_runtime_config(
+    app: FastAPI,
+    actor: str,
+    client_ip: str | None = None,
+    user_agent: str | None = None,
+) -> dict[str, Any]:
+    async with app.state.reload_lock:
+        current: ServerConfig = app.state.config
+        if current.config_path is None:
+            raise RuntimeError("config reload requires a config file path")
+
+        loaded = load_server_config(str(current.config_path))
+        _validate_startup_security(loaded)
+        _apply_runtime_config(current, loaded)
+        disconnected = await _disconnect_agents_with_stale_credentials(app)
+
+        app.state.db.add_security_event(
+            event_type="config_reloaded",
+            actor=actor,
+            client_ip=client_ip,
+            user_agent=user_agent,
+            result="accepted",
+            detail={
+                "config_path": str(current.config_path),
+                "agents": len(current.agents),
+                "api_tokens": len(current.api_tokens),
+                "users": len(current.users),
+                "roles": sorted(current.roles),
+                "disconnected_agents": disconnected,
+            },
+        )
+        await app.state.hub.broadcast_ui({"type": "config_reloaded", "disconnected_agents": disconnected})
+        return {
+            "status": "reloaded",
+            "agents": len(current.agents),
+            "api_tokens": len(current.api_tokens),
+            "users": len(current.users),
+            "roles": sorted(current.roles),
+            "disconnected_agents": disconnected,
+        }
+
+
+def _apply_runtime_config(current: ServerConfig, loaded: ServerConfig) -> None:
+    current.config_path = loaded.config_path
+    current.admin_username = loaded.admin_username
+    current.admin_password_hash = loaded.admin_password_hash
+    current.users = loaded.users
+    current.roles = loaded.roles
+    current.api_tokens = loaded.api_tokens
+    current.agents = loaded.agents
+
+
+async def _disconnect_agents_with_stale_credentials(app: FastAPI) -> list[str]:
+    disconnected: list[str] = []
+    config: ServerConfig = app.state.config
+    hub: ConnectionHub = app.state.hub
+    for node_id in await hub.connected_agent_ids():
+        fingerprint = await hub.agent_credential_fingerprint(node_id)
+        if fingerprint and fingerprint in _enabled_agent_fingerprints(config, node_id):
+            continue
+        if await hub.disconnect_agent(node_id, code=1008, reason="agent credential changed"):
+            disconnected.append(node_id)
+            app.state.db.add_security_event(
+                event_type="agent_disconnected_after_config_reload",
+                actor="system",
+                node_id=node_id,
+                result="disconnected",
+            )
+    return disconnected
+
+
+async def _revoke_agent_runtime(
+    app: FastAPI,
+    node_id: str,
+    actor: str,
+    client_ip: str | None = None,
+    user_agent: str | None = None,
+) -> dict[str, Any] | None:
+    revoked = 0
+    config: ServerConfig = app.state.config
+    for credential in config.agents:
+        if credential.node_id == node_id and credential.enabled:
+            credential.enabled = False
+            revoked += 1
+    if revoked == 0:
+        return None
+
+    disconnected = await app.state.hub.disconnect_agent(node_id, code=1008, reason="agent token revoked")
+    app.state.db.add_security_event(
+        event_type="agent_token_revoked",
+        actor=actor,
+        client_ip=client_ip,
+        user_agent=user_agent,
+        node_id=node_id,
+        result="accepted",
+        detail={"credentials_revoked": revoked, "disconnected": disconnected},
+    )
+    await app.state.hub.broadcast_ui(
+        {"type": "agent_token_revoked", "node_id": node_id, "disconnected": disconnected}
+    )
+    return {"node_id": node_id, "revoked": True, "credentials_revoked": revoked, "disconnected": disconnected}
+
+
+def _enabled_agent_fingerprints(config: ServerConfig, node_id: str) -> set[str]:
+    return {
+        _agent_credential_fingerprint(credential)
+        for credential in config.agents
+        if credential.enabled and credential.node_id == node_id
+    }
+
+
+def _agent_credential_fingerprint(credential: AgentCredential) -> str:
+    material = credential.token_hash
+    if not material:
+        return ""
+    return hashlib.sha256(f"{credential.node_id}:{material}".encode("utf-8")).hexdigest()
 
 
 async def _handle_agent_message(app: FastAPI, node_id: str, message: dict[str, Any]) -> None:
@@ -589,6 +960,18 @@ async def _handle_agent_message(app: FastAPI, node_id: str, message: dict[str, A
             )
             return
         db.save_metrics(node_id, payload)
+        thresholds, _ = db.get_thresholds()
+        for event in db.evaluate_metric_alerts(node_id, payload, thresholds):
+            alert = event["alert"]
+            db.add_security_event(
+                event_type=event["type"],
+                actor="system",
+                node_id=node_id,
+                target=str(alert.get("metric") or ""),
+                result=str(alert.get("status") or ""),
+                detail={"alert_id": alert.get("id"), "threshold": alert.get("threshold"), "value": alert.get("value")},
+            )
+            await hub.broadcast_ui(event)
         await hub.broadcast_ui({"type": "metrics_updated", "node_id": node_id})
         return
 
@@ -642,6 +1025,62 @@ async def _handle_agent_message(app: FastAPI, node_id: str, message: dict[str, A
                 return
             db.update_container_stats(node_id, payloads)
             await hub.broadcast_ui({"type": "containers_updated", "node_id": node_id})
+        return
+
+    if message_type == "command_ack":
+        ack_data = dict(data)
+        if "command_id" not in ack_data and message.get("command_id"):
+            ack_data["command_id"] = message.get("command_id")
+        try:
+            payload = CommandStatePayload.model_validate(ack_data)
+        except ValidationError as exc:
+            db.add_security_event(
+                event_type="agent_payload_invalid",
+                actor=node_id,
+                node_id=node_id,
+                result="rejected",
+                detail={"message_type": message_type, "errors": exc.errors()},
+            )
+            return
+        command = db.mark_command_acknowledged(payload.command_id, node_id)
+        if command:
+            await hub.broadcast_ui({"type": "command_updated", "command": command})
+        else:
+            db.add_security_event(
+                event_type="command_ack_node_mismatch",
+                actor=node_id,
+                node_id=node_id,
+                target=payload.command_id,
+                result="rejected",
+            )
+        return
+
+    if message_type == "command_running":
+        running_data = dict(data)
+        if "command_id" not in running_data and message.get("command_id"):
+            running_data["command_id"] = message.get("command_id")
+        try:
+            payload = CommandStatePayload.model_validate(running_data)
+        except ValidationError as exc:
+            db.add_security_event(
+                event_type="agent_payload_invalid",
+                actor=node_id,
+                node_id=node_id,
+                result="rejected",
+                detail={"message_type": message_type, "errors": exc.errors()},
+            )
+            return
+        command = db.mark_command_running(payload.command_id, node_id)
+        if command:
+            await hub.broadcast_ui({"type": "command_updated", "command": command})
+        else:
+            db.add_security_event(
+                event_type="command_running_node_mismatch",
+                actor=node_id,
+                node_id=node_id,
+                target=payload.command_id,
+                result="rejected",
+            )
         return
 
     if message_type == "command_result":
@@ -700,6 +1139,21 @@ async def _status_watcher(app: FastAPI) -> None:
                 result="timeout",
             )
             await app.state.hub.broadcast_ui({"type": "command_updated", "command": command})
+        now = time.monotonic()
+        if now - app.state.last_rollup_at >= max(60, config.retention.rollup_interval_seconds):
+            app.state.last_rollup_at = now
+            rollups = app.state.db.rollup_metrics()
+            pruned_rollups = app.state.db.prune_rollups(
+                hourly_days=config.retention.hourly_rollup_days,
+                daily_days=config.retention.daily_rollup_days,
+            )
+            if any(rollups.values()) or any(pruned_rollups.values()):
+                app.state.db.add_security_event(
+                    event_type="metrics_rollup_completed",
+                    actor="system",
+                    result="success",
+                    detail={"rollups": rollups, "pruned": pruned_rollups},
+                )
         pruned = app.state.db.prune_metrics(config.retention.raw_metrics_days)
         if pruned:
             app.state.db.add_security_event(

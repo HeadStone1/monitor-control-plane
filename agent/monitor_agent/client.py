@@ -150,7 +150,8 @@ class MonitorAgent:
                 await self._handle_command(websocket, message)
 
     async def _handle_command(self, websocket: Any, message: dict[str, Any]) -> None:
-        command_id = str(message.get("command_id") or "")
+        command_id = str(message.get("command_id") or message.get("request_id") or "")
+        request_id = str(message.get("request_id") or command_id)
         action = str(message.get("action") or "")
         payload = message.get("payload") or {}
         container_id = str(payload.get("container_id") or "")
@@ -158,24 +159,45 @@ class MonitorAgent:
         if not command_id:
             return
 
+        await self._send(
+            websocket,
+            "command_ack",
+            {
+                "command_id": command_id,
+                "request_id": request_id,
+                "status": "received",
+            },
+        )
+
         if not container_id:
             await self._send(
                 websocket,
                 "command_result",
                 {
                     "command_id": command_id,
+                    "request_id": request_id,
                     "status": "failed",
                     "message": "payload.container_id is required",
                 },
             )
             return
 
+        await self._send(
+            websocket,
+            "command_running",
+            {
+                "command_id": command_id,
+                "request_id": request_id,
+                "status": "running",
+            },
+        )
         ok, result = await asyncio.to_thread(self.docker.execute, action, container_id)
         await self._send(
             websocket,
             "command_result",
             {
                 "command_id": command_id,
+                "request_id": request_id,
                 "status": "success" if ok else "failed",
                 "message": result,
             },

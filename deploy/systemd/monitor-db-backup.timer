@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Monitor SQLite backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+Unit=monitor-db-backup.service
+
+[Install]
+WantedBy=timers.target

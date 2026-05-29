@@ -1,0 +1,23 @@
+[Unit]
+Description=Monitor Control Plane Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/monitor
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/monitor/.venv/bin/python -m server.monitor_server --config /etc/monitor/server.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+User=monitor
+Group=monitor
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/monitor /var/log/monitor
+
+[Install]
+WantedBy=multi-user.target
