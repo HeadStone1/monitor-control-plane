@@ -518,6 +518,49 @@ class Database:
         with self._lock:
             self._conn.close()
 
+    def health_summary(self, *, public: bool = False) -> dict[str, Any]:
+        with self._lock:
+            journal_mode = str(self._conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            synchronous = int(self._conn.execute("PRAGMA synchronous").fetchone()[0])
+            if public:
+                return {
+                    "journal_mode": journal_mode,
+                    "synchronous": synchronous,
+                }
+
+            node_count = int(self._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
+            online_nodes = int(
+                self._conn.execute("SELECT COUNT(*) FROM nodes WHERE status = 'online'").fetchone()[0]
+            )
+            metrics_count = int(self._conn.execute("SELECT COUNT(*) FROM metrics").fetchone()[0])
+            hourly_count = int(self._conn.execute("SELECT COUNT(*) FROM metrics_hourly").fetchone()[0])
+            daily_count = int(self._conn.execute("SELECT COUNT(*) FROM metrics_daily").fetchone()[0])
+            active_alerts = int(
+                self._conn.execute("SELECT COUNT(*) FROM alerts WHERE status = 'active'").fetchone()[0]
+            )
+            pending_commands = int(
+                self._conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM commands
+                    WHERE status IN ('pending', 'sent', 'acknowledged', 'running')
+                    """
+                ).fetchone()[0]
+            )
+
+        return {
+            "path": str(self.path),
+            "journal_mode": journal_mode,
+            "synchronous": synchronous,
+            "nodes": node_count,
+            "online_nodes": online_nodes,
+            "raw_metrics": metrics_count,
+            "hourly_rollups": hourly_count,
+            "daily_rollups": daily_count,
+            "active_alerts": active_alerts,
+            "pending_commands": pending_commands,
+        }
+
     def ensure_node(self, node_id: str, name: str | None = None) -> None:
         now = utc_now()
         with self._lock, self._conn:

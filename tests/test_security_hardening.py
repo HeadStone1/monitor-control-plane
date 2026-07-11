@@ -17,6 +17,7 @@ from agent.monitor_agent.collectors.docker_collector import DockerCollector
 from server.monitor_server.app import _handle_agent_message, create_app
 from server.monitor_server.config import AgentCredential, ApiTokenConfig, ServerConfig, UserConfig, load_server_config
 from server.monitor_server.db import Database
+from server.monitor_server.doctor import format_doctor_report, run_config_doctor
 from server.monitor_server.hub import ConnectionHub
 from server.monitor_server.security import hash_secret, verify_secret
 
@@ -639,6 +640,58 @@ def test_sqlite_wal_enabled(tmp_path: Path) -> None:
 
     assert str(journal_mode).lower() == "wal"
     assert synchronous == 1
+
+
+def test_health_reports_public_and_admin_operational_details(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    app = create_app(cfg)
+
+    with TestClient(app) as client:
+        public = client.get("/health")
+        assert public.status_code == 200
+        assert public.json()["status"] == "ok"
+        assert public.json()["database"] == "ok"
+        assert public.json()["wal"] is True
+        assert "database_path" not in public.json()
+        assert "path" not in public.json()
+
+        unauthorized = client.get("/api/admin/health")
+        assert unauthorized.status_code == 401
+
+        login(client)
+        admin = client.get("/api/admin/health")
+        assert admin.status_code == 200
+        payload = admin.json()
+        assert payload["database"]["journal_mode"] == "wal"
+        assert payload["database"]["path"].endswith("monitor.db")
+        assert payload["background"]["status_watcher"] is True
+        assert payload["config"]["command_timeout_seconds"] == cfg.command.timeout_seconds
+
+
+def test_config_doctor_reports_ok_for_hardened_config(tmp_path: Path) -> None:
+    cfg = config(tmp_path, admin_token="", session_secret="not-a-default-session-secret")
+
+    report = run_config_doctor(cfg)
+    text = format_doctor_report(report)
+
+    assert report["status"] == "ok"
+    assert "Config doctor: ok" in text
+    assert "[ok] admin_password_hash" in text
+
+
+def test_config_doctor_reports_runtime_config_errors(tmp_path: Path) -> None:
+    cfg = config(
+        tmp_path,
+        admin_password_hash="not-a-valid-hash",
+        users=[UserConfig(username="viewer", password_hash="bad-hash", role="missing")],
+        agents=[AgentCredential(node_id="agent-a", name="agent-a", token_hash="bad-hash")],
+    )
+
+    report = run_config_doctor(cfg)
+    error_names = {check["name"] for check in report["checks"] if check["status"] == "error"}
+
+    assert report["status"] == "error"
+    assert {"admin_password_hash", "users", "agents", "roles"} <= error_names
 
 
 def test_duplicate_agent_registration_rejected() -> None:

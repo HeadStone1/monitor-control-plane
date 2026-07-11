@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import hashlib
 import logging
@@ -185,8 +186,28 @@ class SecureTransportMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> Any:
+    config: ServerConfig = app.state.config
+    _validate_startup_security(config)
+    app.state.db.init()
+    app.state.status_task = asyncio.create_task(_status_watcher(app))
+    _install_sighup_reload(app)
+    try:
+        yield
+    finally:
+        task = app.state.status_task
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        app.state.db.close()
+
+
 def create_app(config: ServerConfig) -> FastAPI:
-    app = FastAPI(title="Monitor Server", version="0.1.0")
+    app = FastAPI(title="Monitor Server", version="0.1.0", lifespan=_lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=config.allowed_hosts)
     app.add_middleware(SecureTransportMiddleware, config=config)
     app.add_middleware(SecurityHeadersMiddleware)
@@ -205,23 +226,31 @@ def create_app(config: ServerConfig) -> FastAPI:
         config.auth_rate_limit.ws_max_failures,
     )
 
-    @app.on_event("startup")
-    async def startup() -> None:
-        _validate_startup_security(config)
-        app.state.db.init()
-        app.state.status_task = asyncio.create_task(_status_watcher(app))
-        _install_sighup_reload(app)
-
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
-        task = app.state.status_task
-        if task:
-            task.cancel()
-        app.state.db.close()
-
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health() -> dict[str, Any]:
+        database = app.state.db.health_summary(public=True)
+        return {
+            "status": "ok",
+            "version": app.version,
+            "database": "ok",
+            "wal": database["journal_mode"] == "wal",
+        }
+
+    @app.get("/api/admin/health")
+    async def admin_health(_: AuthContext = Depends(require_permission("*"))) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "version": app.version,
+            "database": app.state.db.health_summary(public=False),
+            "background": {"status_watcher": app.state.status_task is not None and not app.state.status_task.done()},
+            "config": {
+                "environment": config.environment,
+                "config_path": str(config.config_path) if config.config_path else "",
+                "command_timeout_seconds": config.command.timeout_seconds,
+                "raw_metrics_days": config.retention.raw_metrics_days,
+                "rollup_interval_seconds": config.retention.rollup_interval_seconds,
+            },
+        }
 
     @app.post("/api/auth/login")
     async def login(request: Request, response: Response) -> dict[str, Any]:

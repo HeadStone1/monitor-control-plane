@@ -284,6 +284,9 @@ single-instance control plane. The main changes are:
   Agent.
 - SQLite now uses WAL mode, includes backup scripts, raw metric retention, and
   hourly/daily rollup tables for long-range metric queries.
+- The server CLI includes `--doctor` for preflight config checks. `/health`
+  stays low-detail for load balancers, while `/api/admin/health` exposes
+  authenticated operational details for administrators.
 - Thresholds are stored on the Server, alerts are evaluated server-side, and the
   WebUI shows alert counts, audit filters, CSV export, node overview cards,
   command confirmation dialogs, dark mode, container filters, and chart
