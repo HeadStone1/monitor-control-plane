@@ -13,21 +13,21 @@
           <div class="brand-mark">M</div>
           <div>
             <h1>Monitor</h1>
-            <p>Linux and Docker control plane</p>
+            <p data-i18n="login.subtitle">Linux and Docker control plane</p>
           </div>
         </div>
         <form id="login-form" class="auth-form">
           <label>
-            Username
+            <span data-i18n="login.username">Username</span>
             <input id="login-username" name="username" autocomplete="username" value="admin" />
           </label>
           <label>
-            Password
+            <span data-i18n="login.password">Password</span>
             <input id="login-password" name="password" type="password" autocomplete="current-password" />
           </label>
-          <button type="submit" class="primary-button">Sign in</button>
+          <button type="submit" class="primary-button" data-i18n="login.signIn">Sign in</button>
         </form>
-        <div class="auth-hint">Development account: admin / dev-admin-password</div>
+        <div class="auth-hint" data-i18n="login.hint">Development account: admin / dev-admin-password</div>
       </div>
     </section>
 
@@ -35,78 +35,85 @@
       <aside class="sidebar">
         <div class="sidebar-brand">
           <div class="brand-mark">M</div>
-          <div>
+          <div class="brand-copy">
             <strong>Monitor</strong>
-            <span>Control Plane</span>
+            <span data-i18n="brand.subtitle">Control Plane</span>
           </div>
+          <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="Collapse navigation" title="Collapse navigation">
+            <span></span>
+          </button>
         </div>
 
         <nav class="nav-list" aria-label="main navigation">
-          <a class="active" href="#overview">Overview</a>
-          <a href="#containers">Containers</a>
-          <a href="#commands">Commands</a>
-          <a href="#audit">Audit</a>
+          <a class="active" href="#overview" data-page-link="overview" title="Overview" data-i18n="nav.overview">Overview</a>
+          <a href="#containers" data-page-link="containers" title="Containers" data-i18n="nav.containers">Containers</a>
+          <a href="#commands" data-page-link="commands" title="Commands" data-i18n="nav.commands">Commands</a>
+          <a href="#audit" data-page-link="audit" title="Audit" data-i18n="nav.audit">Audit</a>
         </nav>
 
         <div class="sidebar-footer">
           <div>
-            <span class="small-label">Realtime</span>
+            <span class="small-label" data-i18n="sidebar.realtime">Realtime</span>
             <strong id="ws-state">disconnected</strong>
           </div>
-          <button id="logout" type="button">Sign out</button>
+          <button id="logout" type="button" data-i18n="auth.signOut">Sign out</button>
         </div>
       </aside>
 
       <main class="main-stage">
         <header class="page-header">
           <div>
-            <span class="eyebrow">Distributed Monitoring</span>
-            <h1>Server Dashboard</h1>
+            <span class="eyebrow" data-i18n="header.eyebrow">Distributed Monitoring</span>
+            <h1 data-i18n="header.title">Server Dashboard</h1>
           </div>
           <div class="header-actions">
             <div class="alert-menu">
               <button id="alerts-toggle" class="alert-button" type="button">
-                Alerts
-                <span id="alert-count">0</span>
+                <span class="alert-label" data-i18n="alerts.title">Alerts</span>
+                <span id="alert-count" class="alert-count">0</span>
               </button>
               <div id="alert-panel" class="alert-panel is-hidden"></div>
             </div>
             <span id="current-user" class="user-pill"></span>
+            <select id="language-select" class="language-select" aria-label="Language">
+              <option value="en">EN</option>
+              <option value="zh">中文</option>
+            </select>
             <button id="theme-toggle" type="button" class="theme-toggle">Dark</button>
-            <button id="refresh" type="button">Refresh</button>
+            <button id="refresh" type="button" data-i18n="actions.refresh">Refresh</button>
           </div>
         </header>
 
-        <section id="overview" class="overview-grid">
+        <section id="overview" class="app-page overview-grid" data-page="overview">
           <article class="stat-card blue">
-            <span>Total Nodes</span>
+            <span data-i18n="stats.totalNodes">Total Nodes</span>
             <strong id="node-count">0</strong>
-            <em>registered agents</em>
+            <em data-i18n="stats.registeredAgents">registered agents</em>
           </article>
           <article class="stat-card green">
-            <span>Online</span>
+            <span data-i18n="stats.online">Online</span>
             <strong id="online-count">0</strong>
-            <em>healthy connections</em>
+            <em data-i18n="stats.healthyConnections">healthy connections</em>
           </article>
           <article class="stat-card yellow">
-            <span>Containers</span>
+            <span data-i18n="stats.containers">Containers</span>
             <strong id="container-count">0</strong>
-            <em>visible containers</em>
+            <em data-i18n="stats.visibleContainers">visible containers</em>
           </article>
           <article class="stat-card red">
-            <span>Commands</span>
+            <span data-i18n="stats.commands">Commands</span>
             <strong id="command-count">0</strong>
-            <em>recent operations</em>
+            <em data-i18n="stats.recentOperations">recent operations</em>
           </article>
         </section>
 
-        <section id="node-overview" class="node-overview-grid" aria-label="node overview"></section>
+        <section id="node-overview" class="app-page node-overview-grid" data-page="overview" aria-label="node overview"></section>
 
-        <section class="dashboard-grid">
+        <section class="app-page dashboard-grid" data-page="overview">
           <section class="panel node-panel">
             <div class="panel-title">
               <div>
-                <h2>Nodes</h2>
+                <h2 data-i18n="panels.nodes">Nodes</h2>
               </div>
             </div>
             <div id="nodes" class="node-list"></div>
@@ -115,8 +122,8 @@
           <section class="panel metric-panel">
             <div class="panel-title">
               <div>
-                <h2 id="selected-node-title">No node selected</h2>
-                <p id="selected-node-meta">Waiting for an agent connection</p>
+                <h2 id="selected-node-title" data-i18n="nodes.noneSelected">No node selected</h2>
+                <p id="selected-node-meta" data-i18n="nodes.waiting">Waiting for an agent connection</p>
               </div>
               <span id="selected-node-status" class="status-chip neutral">unknown</span>
             </div>
@@ -126,18 +133,18 @@
                 <button type="button" data-range="7d">7d</button>
                 <button type="button" data-range="30d">30d</button>
               </div>
-              <button id="chart-zoom-reset" type="button" class="chart-zoom-reset is-hidden">Reset zoom</button>
+              <button id="chart-zoom-reset" type="button" class="chart-zoom-reset is-hidden" data-i18n="chart.resetZoom">Reset zoom</button>
               <div class="threshold-controls" aria-label="metric thresholds">
                 <label>
-                  CPU
+                  <span data-i18n="metrics.cpu">CPU</span>
                   <input id="threshold-cpu" type="number" min="0" max="100" step="1" value="60" />
                 </label>
                 <label>
-                  Memory
+                  <span data-i18n="metrics.memory">Memory</span>
                   <input id="threshold-memory" type="number" min="0" max="100" step="1" value="80" />
                 </label>
                 <label>
-                  Disk
+                  <span data-i18n="metrics.disk">Disk</span>
                   <input id="threshold-disk" type="number" min="0" max="100" step="1" value="85" />
                 </label>
               </div>
@@ -156,30 +163,52 @@
           </section>
         </section>
 
-        <section id="containers" class="panel">
+        <section id="containers" class="app-page panel is-hidden" data-page="containers">
             <div class="panel-title">
               <div>
-                <h2>Containers</h2>
+                <h2 data-i18n="panels.containers">Containers</h2>
               </div>
             </div>
+            <div class="page-insights">
+              <article class="insight-card">
+                <span data-i18n="insights.containersVisible">Visible</span>
+                <strong id="containers-total">0</strong>
+                <em id="containers-scope">-</em>
+              </article>
+              <article class="insight-card green">
+                <span data-i18n="insights.containersRunning">Running</span>
+                <strong id="containers-running-count">0</strong>
+                <em data-i18n="insights.currentNode">current node</em>
+              </article>
+              <article class="insight-card yellow">
+                <span data-i18n="insights.containersStopped">Stopped</span>
+                <strong id="containers-stopped-count">0</strong>
+                <em data-i18n="insights.needsAttention">needs attention</em>
+              </article>
+              <article class="insight-card red">
+                <span data-i18n="insights.containersHot">Hot CPU</span>
+                <strong id="containers-hot-count">0</strong>
+                <em id="containers-memory-total">-</em>
+              </article>
+            </div>
             <div class="container-controls">
-              <input id="container-search" type="search" placeholder="Search name or image" />
+              <input id="container-search" type="search" placeholder="Search name or image" data-i18n-placeholder="containers.search" />
               <select id="container-status-filter" aria-label="container status filter">
-                <option value="all">All statuses</option>
-                <option value="running">Running</option>
-                <option value="stopped">Stopped</option>
+                <option value="all" data-i18n="containers.allStatuses">All statuses</option>
+                <option value="running" data-i18n="containers.running">Running</option>
+                <option value="stopped" data-i18n="containers.stopped">Stopped</option>
               </select>
             </div>
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>Name</th>
-                  <th>Image</th>
-                  <th>Status</th>
-                  <th>CPU</th>
-                  <th>Memory</th>
-                  <th>Actions</th>
+                  <th data-i18n="table.name">Name</th>
+                  <th data-i18n="table.image">Image</th>
+                  <th data-i18n="table.status">Status</th>
+                  <th data-i18n="metrics.cpu">CPU</th>
+                  <th data-i18n="metrics.memory">Memory</th>
+                  <th data-i18n="table.actions">Actions</th>
                 </tr>
               </thead>
               <tbody id="containers-table"></tbody>
@@ -187,28 +216,75 @@
           </div>
         </section>
 
-        <section class="activity-grid">
+        <section class="app-page activity-grid is-hidden" data-page="commands">
           <section id="commands" class="panel">
             <div class="panel-title">
               <div>
-                <h2>Commands</h2>
+                <h2 data-i18n="panels.commands">Commands</h2>
               </div>
+            </div>
+            <div class="page-insights">
+              <article class="insight-card">
+                <span data-i18n="insights.commandsTotal">Total</span>
+                <strong id="commands-total">0</strong>
+                <em data-i18n="insights.recentWindow">recent window</em>
+              </article>
+              <article class="insight-card green">
+                <span data-i18n="insights.commandsSuccess">Success</span>
+                <strong id="commands-success-count">0</strong>
+                <em id="commands-latest-status">-</em>
+              </article>
+              <article class="insight-card yellow">
+                <span data-i18n="insights.commandsActive">In flight</span>
+                <strong id="commands-active-count">0</strong>
+                <em data-i18n="insights.awaitingAgent">awaiting agent</em>
+              </article>
+              <article class="insight-card red">
+                <span data-i18n="insights.commandsProblem">Problem</span>
+                <strong id="commands-problem-count">0</strong>
+                <em data-i18n="insights.failedTimeout">failed / timeout</em>
+              </article>
             </div>
             <div id="commands-list" class="event-list"></div>
           </section>
 
+        </section>
+
+        <section class="app-page activity-grid is-hidden" data-page="audit">
           <section id="audit" class="panel">
             <div class="panel-title">
               <div>
-                <h2>Audit Logs</h2>
+                <h2 data-i18n="panels.auditLogs">Audit Logs</h2>
               </div>
             </div>
+            <div class="page-insights">
+              <article class="insight-card">
+                <span data-i18n="insights.auditVisible">Visible Logs</span>
+                <strong id="audit-total">0</strong>
+                <em data-i18n="insights.filteredResult">filtered result</em>
+              </article>
+              <article class="insight-card green">
+                <span data-i18n="insights.auditSecurity">Security</span>
+                <strong id="audit-security-count">0</strong>
+                <em data-i18n="insights.securityEvents">security events</em>
+              </article>
+              <article class="insight-card yellow">
+                <span data-i18n="insights.auditSources">Sources</span>
+                <strong id="audit-source-count">0</strong>
+                <em data-i18n="insights.uniqueClients">unique clients</em>
+              </article>
+              <article class="insight-card red">
+                <span data-i18n="insights.auditFailures">Failures</span>
+                <strong id="audit-failure-count">0</strong>
+                <em data-i18n="insights.reviewFailures">review first</em>
+              </article>
+            </div>
             <div class="audit-controls">
-              <input id="audit-node-filter" type="text" placeholder="Node" />
-              <input id="audit-action-filter" type="text" placeholder="Action" />
+              <input id="audit-node-filter" type="text" placeholder="Node" data-i18n-placeholder="audit.node" />
+              <input id="audit-action-filter" type="text" placeholder="Action" data-i18n-placeholder="audit.action" />
               <input id="audit-from-filter" type="datetime-local" />
               <input id="audit-to-filter" type="datetime-local" />
-              <button id="audit-export" type="button">Export CSV</button>
+              <button id="audit-export" type="button" data-i18n="audit.exportCsv">Export CSV</button>
             </div>
             <div id="audit-list" class="event-list"></div>
           </section>
@@ -219,11 +295,11 @@
     <div id="toast" class="toast" role="status"></div>
     <div id="command-dialog" class="modal-backdrop is-hidden" role="dialog" aria-modal="true" aria-labelledby="command-dialog-title">
       <div class="modal">
-        <h2 id="command-dialog-title">Confirm command</h2>
+        <h2 id="command-dialog-title" data-i18n="dialog.confirmCommand">Confirm command</h2>
         <p id="command-dialog-message"></p>
         <div class="modal-actions">
-          <button id="command-dialog-cancel" type="button">Cancel</button>
-          <button id="command-dialog-confirm" type="button" class="danger">Confirm</button>
+          <button id="command-dialog-cancel" type="button" data-i18n="dialog.cancel">Cancel</button>
+          <button id="command-dialog-confirm" type="button" class="danger" data-i18n="dialog.confirm">Confirm</button>
         </div>
       </div>
     </div>

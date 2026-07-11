@@ -1,39 +1,23 @@
 # Monitor Control Plane
 
-Monitor Control Plane 是一个通过 vibe coding 启动的轻量级分布式 Linux / Docker 监控与控制原型。它用于验证 `Agent -> Server -> WebUI` 的基本闭环：Agent 主动连接中心端，上报主机与 Docker 状态，WebUI 展示节点和容器，并通过 Server 下发容器启停命令。
+Monitor Control Plane 是一个轻量级的 Linux / Docker 监控与控制面板。它采用 `Agent -> Server -> WebUI` 架构：Agent 主动连接 Server，上报主机指标和 Docker 容器状态；WebUI 通过同源 API 和 WebSocket 查看节点、指标、容器、命令、告警和审计日志，并在授权后下发有限的容器控制命令。
 
-> 当前项目仍是 MVP / 学习型原型，不建议直接暴露到公网或用于生产环境。
+> 当前项目适合个人实验室、内网测试、学习和原型验证。不要在未完成安全评估、网络隔离、备份和权限收敛前直接暴露到公网或生产环境。
 
-## 适合谁
+## 功能概览
 
-- 想学习分布式监控系统基本架构的人。
-- 想研究 Agent、Server、WebUI 如何协作的人。
-- 想在个人实验室、内网、测试环境中监控 Linux/Docker 的个人用户。
-- 想基于 Python 快速验证运维控制台原型的开发者。
-
-## 不适合谁
-
-- 需要立刻上线生产环境的团队。
-- 需要强合规、多租户、细粒度 RBAC 的企业场景。
-- 需要替代 Prometheus、Grafana、Zabbix、Datadog 等成熟监控平台的场景。
-- 无法接受 Docker socket 权限风险的环境。
-
-## 主要风险与责任边界
-
-该项目包含远程控制 Docker 容器的能力，存在较高安全风险。
-
-- Agent 访问 Docker socket 时，通常等同于获得目标机器上的高权限能力。
-- 如果 token、密码或 session secret 泄露，攻击者可能查看节点状态或执行容器操作。
-- 如果没有启用 HTTPS/WSS，网络中间人可能窃听或篡改通信。
-- 如果依赖库、Python 运行时、Docker、浏览器、TLS 栈或操作系统存在 0day 漏洞，本项目无法保证完全防护。
-- 使用者需要自行评估风险、备份数据、限制网络访问、替换默认密钥，并承担部署和使用后果。
-
-项目负责人/作者不对以下情况承担责任：
-
-- 数据丢失、服务中断、容器误操作。
-- 因错误配置、弱密码、泄露 token 导致的安全事件。
-- 因第三方依赖、操作系统、Docker、网络环境或 0day 漏洞导致的损失。
-- 将本 MVP 直接用于生产或商业环境带来的风险。
+- 分布式 Agent 主动上报：主机信息、心跳、CPU、内存、磁盘、Docker 容器清单和容器资源统计。
+- WebUI 控制台：节点概览、指标折线图、容器列表、命令记录、审计日志、告警列表。
+- 多页面 WebUI：`Overview`、`Containers`、`Commands`、`Audit` 独立页面切换，不再只是锚点跳转。
+- Google / Material 风格界面：浅色/深色模式、可折叠导航、响应式布局、操作确认弹窗。
+- 中英文切换：顶部 `EN / 中文` 语言选择，静态文案和动态提示都会切换。
+- 指标图表：支持 `1h / 7d / 30d` 范围、阈值线、悬浮提示和拖拽缩放。
+- 服务端阈值和告警：阈值持久化在 Server，指标超过阈值后创建 active alert，恢复后 resolved。
+- 容器控制：仅支持白名单动作 `start / stop / restart`，且 Agent 端要求容器带允许控制的 label。
+- 命令闭环：命令状态支持 `pending / sent / acknowledged / running / success / failed / timeout`。
+- 审计日志：记录登录、认证失败、CSRF 失败、命令、Agent 连接、告警、配置重载等事件。
+- Prometheus：Server 提供 `/metrics` 文本端点，需要 `metrics:read` 权限。
+- SQLite 数据层：WAL 模式、原始指标保留、小时/天 rollup、备份脚本。
 
 ## 架构
 
@@ -43,214 +27,307 @@ Linux Server B [monitor-agent] ----> [monitor-server + SQLite + WebUI] <--- Brow
 Linux Server C [monitor-agent] --/
 ```
 
-核心原则：
+设计原则：
 
-- Agent 主动连接 Server，Agent 不开放入站端口。
-- Server 负责认证、数据存储、WebUI API、WebSocket 推送和命令下发。
-- WebUI 通过同源 API 和 WebSocket 与 Server 通信。
-- 生产环境必须把 Server 放在 Caddy/Nginx 等 HTTPS 反向代理后面，并使用 WSS。
+- Agent 只主动连出，不开放入站端口。
+- Server 负责认证、授权、数据存储、WebUI API、WebSocket 推送和命令下发。
+- WebUI 只连接同源 HTTP/WebSocket 接口，CSP 使用更收敛的 `connect-src 'self'`。
+- 生产部署应放在 Nginx/Caddy 等 HTTPS/WSS 反向代理后面。
 
 ## 技术栈
 
-- Python 3.11+
+- Python 3.10+ / 3.11 推荐
 - FastAPI + WebSocket
 - SQLite
-- Python Agent: `psutil`, `docker`, `websockets`
-- 原生 HTML/CSS/JS WebUI，偏 Google / Material 风格
-- JSON over WebSocket
+- Agent: `psutil`、`docker`、`websockets`
+- WebUI: 原生 HTML/CSS/JavaScript，无前端框架
+- 密码和 token 哈希：Argon2id
 
-## 指标时间范围
+## 安全边界
 
-WebUI 支持按时间范围查看节点指标：
+这个项目包含远程查看和控制 Docker 容器的能力，必须认真理解下面的边界：
 
-- 近 1 小时：展示原始采样点。
-- 近 7 天：按小时聚合，折线展示每小时平均值，悬浮提示展示平均值、最高值和峰值时间。
-- 近 30 天：按天聚合，折线展示每日平均值，悬浮提示展示平均值、最高值和峰值时间。
+- Agent 能访问 Docker socket 时，通常接近宿主机高权限能力。应用层白名单和 label 限制只能约束正常代码路径，不能抵消 Agent 进程被攻破后的 Docker socket 风险。
+- 建议 Agent 以最小权限运行，限制网络访问，优先考虑 Rootless Docker，或长期迁移到 Docker API over TLS + 授权代理。
+- 真实配置文件 `server.yaml`、`agent.yaml` 不应提交到 Git。
+- 生产模式默认禁用长期静态 `admin_token`，自动化访问应使用 scoped `api_tokens`。
+- 管理员密码、API token、Agent token 均应使用 Argon2id 哈希存储在 Server 配置中。
+- Agent 本地配置仍需要保存明文 token 用于认证，应限制配置文件权限，避免普通用户可读。
+- WebUI 使用 HttpOnly SameSite Cookie session + CSRF token；所有修改类请求都需要 `X-CSRF-Token`。
 
-Server 会保留原始指标数据，并定时写入 `metrics_hourly` / `metrics_daily` 汇总表。`1h` 查询读取原始数据，`7d` 优先读取小时汇总，`30d` 优先读取天汇总；如果汇总尚未生成，会自动回退到原始数据动态聚合。
+## 快速开始
 
-WebUI 支持设置 CPU、Memory、Disk 安全阈值，并在图表中显示对应虚线界限。阈值会持久化在 Server 侧，Agent 上报指标后由 Server 评估告警，WebUI 顶部会显示当前告警数量。
-
-## 安全设计现状
-
-已实现：
-
-- WebUI 登录验证，服务端签名 session token。
-- Web 会话使用 `HttpOnly + SameSite=Strict` Cookie，降低 XSS 后直接窃取 token 的风险。
-- Agent/UI WebSocket 连接后发送首条 `auth` 消息，避免 token 出现在 URL query 中。
-- Server 添加基础安全响应头，包括 CSP、`X-Frame-Options`、`X-Content-Type-Options`、`Referrer-Policy`。
-- Server 使用 `TrustedHostMiddleware` 限制 Host header，默认只允许 `127.0.0.1` 和 `localhost`。
-- WebUI 动态内容使用 DOM API 和 `textContent` 写入，避免直接拼接 HTML。
-- 状态 class 使用 allowlist，避免把服务端原始值拼进 CSS class。
-- 容器命令有服务端动作白名单，并确认容器属于当前节点。
-- Agent 侧再次校验动作白名单和容器 ID 格式。
-- 危险容器操作写入审计日志。
-- 真实配置文件不应提交到 Git，仓库只保留 `*.example.yaml`。
-- 管理员密码仅支持 `admin_password_hash`，不允许在服务端配置中保存明文密码。
-- Agent token 支持 `token_hash`，并绑定到具体 `node_id`。
-- 非本机 `ws://` Agent 连接默认被拒绝，生产模式要求安全传输和 Secure Cookie。
-- 登录和 WebSocket 认证失败有基础限速，Agent 容器清单/状态消息有数量上限。
-
-仍需加强：
-
-- Agent token 轮换/吊销流程和更细粒度审计。
-- 更完整的 Agent token 运行时热重载、吊销 API 和轮换流程。
-- 增加命令 ACK 状态机、RBAC、审计筛选导出和服务端告警。
-- 增加依赖漏洞扫描、自动化浏览器安全测试和发布流程。
-- 为 Server/Agent 制作 systemd、Docker、升级、回滚和备份方案。
-
-## 首次使用
-
-创建虚拟环境并安装依赖：
+### 1. 安装依赖
 
 ```powershell
+cd G:\33258\Desktop\Monitor
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-这会在当前项目目录创建 `.venv`，并把依赖安装到项目虚拟环境里，不会安装到系统 Python。
-
-创建本地配置：
+### 2. 创建本地配置
 
 ```powershell
 Copy-Item server.example.yaml server.yaml
 Copy-Item agent.example.yaml agent.yaml
 ```
 
-这会复制示例配置。`server.yaml` 和 `agent.yaml` 是本机真实配置，已被 `.gitignore` 忽略，不应提交。
+`server.yaml` 和 `agent.yaml` 已被 `.gitignore` 忽略，不要提交。
 
-然后修改 `server.yaml`：
+### 3. 生成哈希
 
-先生成管理员密码和 Agent token 的哈希：
+管理员密码、Agent token、API token 都用同一个命令生成 Argon2id 哈希：
 
 ```powershell
 .\.venv\Scripts\python.exe -m server.monitor_server --hash-secret "your-admin-password"
 .\.venv\Scripts\python.exe -m server.monitor_server --hash-secret "your-agent-token"
 ```
 
-这条命令会打印 Argon2id 哈希。把打印结果分别填入 `admin_password_hash` 和 `agents[].token_hash`。旧版 PBKDF2 hash 不再接受，升级后需要一次性重新生成并替换配置里的 hash。
+把输出分别填入：
 
-```yaml
-allowed_hosts:
-  - 127.0.0.1
-  - localhost
-admin_token: replace-with-long-random-value
-admin_username: admin
-admin_password_hash: replace-with-generated-admin-password-hash
-session_secret: replace-with-long-random-secret
-agents:
-  - node_id: dev-agent
-    name: dev-agent
-    token_hash: replace-with-generated-agent-token-hash
-    enabled: true
-```
+- `server.yaml` 的 `admin_password_hash`
+- `server.yaml` 的 `users[].password_hash`
+- `server.yaml` 的 `agents[].token_hash`
+- 如需要 API token，则填入 `api_tokens[].token_hash`
 
-再修改 `agent.yaml`，让 `token` 与生成 `token_hash` 时输入的明文 Agent token 一致：
+Agent 端 `agent.yaml` 的 `token` 要填写生成 Agent hash 时输入的明文 token。
 
-```yaml
-server_url: ws://127.0.0.1:8000/agent/ws
-agent_id: dev-agent
-agent_name: dev-agent
-token: replace-with-long-random-agent-token
-allow_insecure_transport: false
-```
-
-启动 Server：
+### 4. 启动 Server
 
 ```powershell
+cd G:\33258\Desktop\Monitor
 .\.venv\Scripts\python.exe -m server.monitor_server --config server.yaml
 ```
 
-这条命令会启动中心端 API、WebSocket 和 WebUI。启动后打开：
+浏览器打开：
 
 ```text
 http://127.0.0.1:8000
 ```
 
-启动 Agent：
+### 5. 启动 Agent
+
+新开一个 PowerShell：
 
 ```powershell
+cd G:\33258\Desktop\Monitor
 .\.venv\Scripts\python.exe -m agent.monitor_agent --config agent.yaml
 ```
 
-这条命令会启动本机 Agent，主动连接 Server，并上报系统指标与 Docker 容器信息。
-
-## 环境变量覆盖
-
-Server 支持用环境变量覆盖敏感配置：
+默认开发登录账号通常是：
 
 ```text
-MONITOR_ADMIN_TOKEN
-MONITOR_ADMIN_USERNAME
-MONITOR_ADMIN_PASSWORD_HASH
-MONITOR_SESSION_SECRET
-MONITOR_SESSION_TTL_HOURS
-MONITOR_ALLOWED_HOSTS
-MONITOR_DATABASE_PATH
-MONITOR_HOST
-MONITOR_PORT
-MONITOR_ENV
-MONITOR_SECURE_COOKIES
-MONITOR_TRUST_PROXY_HEADERS
-MONITOR_REQUIRE_SECURE_TRANSPORT
+username: admin
+password: 你在 server.yaml 中配置的管理员密码
 ```
 
-`MONITOR_AGENT_TOKENS` is no longer supported. The Server does not accept plaintext Agent tokens; use `agents[].token_hash`. `MONITOR_ALLOWED_HOSTS` supports comma-separated values:
+## 示例配置
+
+最小开发配置结构：
+
+```yaml
+host: 127.0.0.1
+port: 8000
+environment: development
+allowed_hosts:
+  - 127.0.0.1
+  - localhost
+database_path: data/monitor.db
+secure_cookies: false
+trust_proxy_headers: false
+require_secure_transport: false
+
+admin_username: admin
+admin_password_hash: replace-with-generated-admin-password-hash
+session_secret: replace-with-long-random-secret
+
+users:
+  - username: admin
+    password_hash: replace-with-generated-admin-password-hash
+    role: admin
+    enabled: true
+
+roles:
+  viewer:
+    - nodes:read
+    - containers:read
+    - metrics:read
+    - commands:read
+    - audit:read
+  operator:
+    - nodes:read
+    - containers:read
+    - metrics:read
+    - commands:read
+    - commands:create
+    - audit:read
+  admin:
+    - "*"
+
+agents:
+  - node_id: dev-agent
+    name: dev-agent
+    token_id: token-2026-05
+    token_hash: replace-with-generated-agent-token-hash
+    enabled: true
+```
+
+Agent 配置示例：
+
+```yaml
+server_url: ws://127.0.0.1:8000/agent/ws
+agent_id: dev-agent
+agent_name: dev-agent
+token: replace-with-plain-agent-token
+tls_verify: true
+allow_insecure_transport: false
+
+docker:
+  enabled: true
+  allowed_labels:
+    monitor.control-plane.allow: "true"
+```
+
+如果要允许某个容器被远程 start/stop/restart，需要给容器加 label：
 
 ```text
-monitor.example.com,127.0.0.1,localhost
+monitor.control-plane.allow=true
 ```
 
-## 生产前必须修改
+没有这个 label 的容器可以展示，但 Agent 不会执行控制动作。
 
-- 替换所有默认密码、token、`session_secret`。
-- 使用 HTTPS/WSS，禁止明文公网访问。
-- 把 `allowed_hosts` 改成你的真实域名或内网 IP。
-- 将 Server 绑定到内网地址或放在反向代理后。
-- 限制 WebUI 访问来源，例如 VPN、堡垒机、内网网段。
-- 让 Agent 以最小权限运行，并谨慎授予 Docker socket 访问权；优先考虑 Rootless Docker，或使用 Docker API over TLS + 授权代理限制可调用 API。
-- 配置日志轮转和数据库备份；SQLite 默认启用 WAL，建议每天备份 `data/monitor.db`。
-- 定期更新依赖、Python、Docker 和操作系统补丁。
+## WebUI 页面
 
-## 数据库备份
+- `Overview`：全局节点统计、节点概览卡片、节点列表、指标图表、阈值配置和图表缩放。
+- `Containers`：容器运行/停止/高 CPU/内存摘要、搜索、状态过滤、授权后的 start/stop/restart 操作。
+- `Commands`：命令总数、成功数、进行中、失败/超时、最近状态和命令列表。
+- `Audit`：可见日志、安全事件、来源 IP、失败事件、筛选和 CSV 导出。
 
-Server 使用 SQLite，默认数据库路径是 `data/monitor.db`。建议在停机窗口或低峰期定期备份：
+顶部工具：
+
+- `Alerts`：查看 active/resolved 告警摘要。
+- `EN / 中文`：切换界面语言。
+- `Dark / Light`：切换深色/浅色模式。
+- `Refresh`：手动刷新数据。
+
+## 运维接口
+
+- `GET /health`：低细节健康检查，适合负载均衡器。
+- `GET /api/admin/health`：管理员运维详情。
+- `POST /api/admin/config/reload`：运行时重载用户、角色、Agent、API token 等认证配置。
+- `POST /api/admin/agents/{node_id}/revoke`：运行时吊销指定 Agent，并断开当前 WebSocket。
+- `GET /metrics`：Prometheus 文本指标，需要 `metrics:read` 权限。
+
+运行时 revoke 不会自动改写 `server.yaml`。如果要持久吊销，需要手动把对应 Agent 配置改成 `enabled: false`，再 reload。
+
+Linux/systemd 部署还支持通过 `SIGHUP` 触发配置重载。
+
+## 数据库与备份
+
+默认 SQLite 路径：
+
+```text
+data/monitor.db
+```
+
+数据库初始化时启用：
+
+```text
+PRAGMA journal_mode=WAL
+PRAGMA synchronous=NORMAL
+```
+
+Windows 备份：
 
 ```powershell
 .\scripts\backup_sqlite.ps1
 ```
 
-脚本会调用 SQLite CLI 的 `.backup` 命令，把数据库备份到 `backups/monitor-YYYYMMDD-HHMMSS.db`。恢复时先停止 Server，再用备份文件替换当前数据库文件。
+Linux 备份：
 
-## Deployment
+```bash
+./scripts/backup_sqlite.sh
+```
 
-Deployment-ready examples are included:
+恢复时建议先停止 Server，再用备份文件替换当前数据库文件。
 
+## 测试与检查
+
+本地建议在提交前运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall agent server tests
+.\.venv\Scripts\python.exe -m pytest
+node --check web/app.js
+.\.venv\Scripts\python.exe -m pip_audit -r requirements.txt
+```
+
+当前测试覆盖重点：
+
+- 明文密码和旧 hash 拒绝启动。
+- CSRF、session、RBAC、scoped API token。
+- Agent token 绑定 node_id。
+- Agent A 不能回填 Agent B 的命令结果。
+- 重复 Agent 连接拒绝。
+- WebSocket 安全传输判断。
+- Pydantic payload 校验。
+- Docker allowed label 限制。
+- 命令 ACK/running/result/timeout 状态机。
+- SQLite WAL、metrics rollup、告警创建/恢复。
+- WebUI 页面切换、语言切换、操作确认、容器筛选、图表缩放。
+
+## CI 与部署材料
+
+仓库包含：
+
+- `.github/workflows/security.yml`
+- `.github/dependabot.yml`
+- `Dockerfile`
+- `docker-compose.yml`
 - `deploy/systemd/monitor-server.service`
 - `deploy/systemd/monitor-agent.service`
 - `deploy/systemd/monitor-db-backup.service`
 - `deploy/systemd/monitor-db-backup.timer`
-- `Dockerfile`
-- `docker-compose.yml`
+- `docs/deployment.md`
+- `scripts/backup_sqlite.ps1`
 - `scripts/backup_sqlite.sh`
 
-See `docs/deployment.md` for systemd, Docker Compose, SQLite backup, and Docker socket hardening notes.
+## 生产部署前检查
 
-## Prometheus
+- 替换所有默认密码、token、`session_secret`。
+- 使用 `environment: production`。
+- 使用 HTTPS/WSS，设置 `secure_cookies: true` 和 `require_secure_transport: true`。
+- 如果在反向代理后面运行，设置 `trust_proxy_headers: true`，并只信任自己的代理。
+- 配置真实 `allowed_hosts`。
+- 不要在 production 配置 `admin_token`。
+- 限制 WebUI 访问来源，例如 VPN、堡垒机、内网网段或反向代理认证。
+- 为 `data/monitor.db` 做定期备份和恢复演练。
+- 严格限制 Agent 所在机器的 Docker socket 权限。
+- 给允许远程控制的容器显式添加 `monitor.control-plane.allow=true` label。
+- 定期运行依赖漏洞扫描并更新依赖。
 
-The Server exposes a Prometheus text endpoint at `/metrics`. It requires
-`metrics:read`, so use a scoped API token instead of anonymous scraping:
+## Git 提交建议
 
-```yaml
-api_tokens:
-  - name: prometheus
-    token_hash: replace-with-generated-token-hash
-    scopes:
-      - metrics:read
-    enabled: true
+这轮前端和文档改动建议一起提交：
+
+```text
+README.md
+web/index.html
+web/app.js
+web/styles.css
+tests/test_security_hardening.py
 ```
 
-Then configure Prometheus with a Bearer token for the scrape target.
+不建议提交：
+
+```text
+server.yaml
+agent.yaml
+data/
+.venv/
+```
+
+这些文件包含本地配置、数据库或虚拟环境，已经在 `.gitignore` 中忽略。
 
 ## License
 
@@ -261,100 +338,3 @@ This project is source-available under the Monitor Personal Use License v0.1.
 - This is not an OSI open source license.
 
 See [LICENSE](LICENSE) for details.
-
-## Latest Update
-
-The latest release hardens the project from a local MVP into a safer
-single-instance control plane. The main changes are:
-
-- Authentication now rejects plaintext admin passwords and legacy PBKDF2
-  hashes. Admin passwords, Agent tokens, and API tokens must use Argon2id
-  hashes generated with `python -m server.monitor_server --hash-secret`.
-- Browser sessions include CSRF protection, scoped RBAC permissions, and
-  production startup checks for secure cookies, secure transport, and disabled
-  static `admin_token`.
-- Agent authentication is bound to `node_id`, duplicate Agent connections are
-  rejected, WebSocket secure-transport checks understand trusted proxy headers,
-  and Agent payloads are schema-validated before database writes.
-- Container commands now have a full `sent -> acknowledged -> running ->
-  success/failed/timeout` lifecycle, with node-bound command result updates and
-  timeout auditing.
-- Docker control actions require allowed container labels, so unlabeled
-  containers remain visible but cannot be started, stopped, or restarted by the
-  Agent.
-- SQLite now uses WAL mode, includes backup scripts, raw metric retention, and
-  hourly/daily rollup tables for long-range metric queries.
-- The server CLI includes `--doctor` for preflight config checks. `/health`
-  stays low-detail for load balancers, while `/api/admin/health` exposes
-  authenticated operational details for administrators.
-- Thresholds are stored on the Server, alerts are evaluated server-side, and the
-  WebUI shows alert counts, audit filters, CSV export, node overview cards,
-  command confirmation dialogs, dark mode, container filters, and chart
-  drag-to-zoom.
-- CI now runs compile checks, pytest, JavaScript syntax checks, and `pip-audit`;
-  Dependabot is enabled for GitHub Actions and Python dependencies.
-- Deployment examples now include systemd units, Dockerfile, Docker Compose,
-  SQLite backup scripts, and deployment notes.
-
-## Development Workflow
-
-The `main` branch should be protected. Do not push feature or security work
-directly to `main`.
-
-Recommended workflow:
-
-```text
-create a feature branch -> push the branch -> open a pull request -> wait for CI -> merge
-```
-
-Required local checks before opening a pull request:
-
-```powershell
-.\.venv\Scripts\python.exe -m compileall agent server tests
-.\.venv\Scripts\python.exe -m pytest tests
-node --check web/app.js
-.\.venv\Scripts\python.exe -m pip_audit -r requirements.txt
-```
-
-The GitHub Actions workflow runs the same core checks on pull requests.
-
-## Security Hardening Update
-
-The current security baseline is stricter than the initial MVP:
-
-- Admin login only supports `admin_password_hash`; generate it with `python -m server.monitor_server --hash-secret "your-password"`.
-- Plaintext `admin_password`, `users[].password`, and `MONITOR_ADMIN_PASSWORD` are rejected at config load time.
-- Password and token hashes must be Argon2id. Legacy PBKDF2 hashes and plaintext Agent token fields are rejected; regenerate hashes with `--hash-secret` during upgrade.
-- Agent credentials are bound to specific node IDs through the `agents` config list.
-- A leaked token for one Agent can no longer claim an arbitrary `agent_id`.
-- Agent token hashes are required through `token_hash`; `agent_tokens`, `MONITOR_AGENT_TOKENS`, and `agents[].token` are rejected.
-- Admins can reload runtime auth config with `POST /api/admin/config/reload`; Linux deployments can also send `SIGHUP`.
-- Admins can revoke an Agent at runtime with `POST /api/admin/agents/{node_id}/revoke`, which disables the in-memory credential and disconnects the current Agent WebSocket.
-- Runtime revoke does not rewrite `server.yaml`; persist revocation by setting the matching `agents[].enabled: false` in config, then reload.
-- Container commands now report `sent`, `acknowledged`, `running`, `success`, `failed`, or `timeout`; timeout messages distinguish commands that were never acknowledged from commands that started but did not finish.
-- Metrics rollup stores hourly and daily summaries, and long-range queries prefer those summaries before falling back to raw metrics.
-- Threshold settings are stored on the Server and drive active/resolved alert events pushed to WebUI.
-- Audit logs can be filtered by node, action, and time range, and the current WebUI result set can be exported as CSV.
-- Metric charts support drag-to-zoom selection and reset without adding a frontend framework.
-- Production mode requires `secure_cookies: true` and `require_secure_transport: true`.
-- Non-loopback Agent `ws://` connections are blocked unless explicitly opted in with `allow_insecure_transport: true`.
-- Login and WebSocket authentication failures are rate limited.
-- Agent inventory/stat payloads are capped to reduce resource-exhaustion risk.
-
-Recommended production server config shape:
-
-```yaml
-environment: production
-host: 127.0.0.1
-secure_cookies: true
-trust_proxy_headers: true
-require_secure_transport: true
-admin_username: admin
-admin_password_hash: replace-with-generated-hash
-session_secret: replace-with-long-random-secret
-agents:
-  - node_id: prod-linux-01
-    name: prod-linux-01
-    token_hash: replace-with-generated-agent-token-hash
-    enabled: true
-```

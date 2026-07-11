@@ -11,6 +11,7 @@ const state = {
   metrics: [],
   metricPayload: null,
   metricRange: localStorage.getItem("monitor.metricRange") || "1h",
+  language: loadLanguage(),
   theme: loadTheme(),
   thresholds: loadThresholds(),
   auditFilters: { nodeId: "", action: "", from: "", to: "" },
@@ -18,6 +19,8 @@ const state = {
   metricZoom: null,
   chartSelection: null,
   chartModel: null,
+  currentPage: loadPage(),
+  sidebarCollapsed: loadSidebarCollapsed(),
   selectedNodeId: localStorage.getItem("monitor.selectedNodeId") || null,
   ws: null,
   refreshTimer: null,
@@ -31,7 +34,11 @@ const els = {
   loginForm: document.querySelector("#login-form"),
   username: document.querySelector("#login-username"),
   password: document.querySelector("#login-password"),
+  pageTitle: document.querySelector(".page-header h1"),
   logout: document.querySelector("#logout"),
+  sidebarToggle: document.querySelector("#sidebar-toggle"),
+  navLinks: document.querySelectorAll("[data-page-link]"),
+  pages: document.querySelectorAll("[data-page]"),
   refresh: document.querySelector("#refresh"),
   wsState: document.querySelector("#ws-state"),
   currentUser: document.querySelector("#current-user"),
@@ -39,10 +46,26 @@ const els = {
   onlineCount: document.querySelector("#online-count"),
   containerCount: document.querySelector("#container-count"),
   commandCount: document.querySelector("#command-count"),
+  containersTotal: document.querySelector("#containers-total"),
+  containersScope: document.querySelector("#containers-scope"),
+  containersRunningCount: document.querySelector("#containers-running-count"),
+  containersStoppedCount: document.querySelector("#containers-stopped-count"),
+  containersHotCount: document.querySelector("#containers-hot-count"),
+  containersMemoryTotal: document.querySelector("#containers-memory-total"),
+  commandsTotal: document.querySelector("#commands-total"),
+  commandsSuccessCount: document.querySelector("#commands-success-count"),
+  commandsActiveCount: document.querySelector("#commands-active-count"),
+  commandsProblemCount: document.querySelector("#commands-problem-count"),
+  commandsLatestStatus: document.querySelector("#commands-latest-status"),
+  auditTotal: document.querySelector("#audit-total"),
+  auditSecurityCount: document.querySelector("#audit-security-count"),
+  auditSourceCount: document.querySelector("#audit-source-count"),
+  auditFailureCount: document.querySelector("#audit-failure-count"),
   alertCount: document.querySelector("#alert-count"),
   alertsToggle: document.querySelector("#alerts-toggle"),
   alertPanel: document.querySelector("#alert-panel"),
   themeToggle: document.querySelector("#theme-toggle"),
+  languageSelect: document.querySelector("#language-select"),
   nodeOverview: document.querySelector("#node-overview"),
   nodes: document.querySelector("#nodes"),
   containerSearch: document.querySelector("#container-search"),
@@ -79,11 +102,273 @@ const els = {
 
 let commandDialogResolve = null;
 
+const translations = {
+  en: {
+    "actions.refresh": "Refresh",
+    "actions.restart": "Restart",
+    "actions.start": "Start",
+    "actions.stop": "Stop",
+    "alerts.active": "Active",
+    "alerts.alert": "Alert",
+    "alerts.none": "No alerts.",
+    "alerts.resolved": "Resolved",
+    "alerts.title": "Alerts",
+    "audit.action": "Action",
+    "audit.exportCsv": "Export CSV",
+    "audit.node": "Node",
+    "audit.none": "No audit logs yet.",
+    "auth.signOut": "Sign out",
+    "brand.subtitle": "Control Plane",
+    "chart.noMetrics": "No metrics yet",
+    "chart.resetZoom": "Reset zoom",
+    "commands.confirmMessage": "Confirm {action} for container {container} on node {node}. This command will be sent immediately.",
+    "commands.none": "No commands yet.",
+    "commands.selectNodeFirst": "Select a node first.",
+    "containers.allStatuses": "All statuses",
+    "containers.noMatches": "No containers match the current filters.",
+    "containers.noneVisible": "No visible containers on the selected node.",
+    "containers.readOnly": "read only",
+    "containers.running": "Running",
+    "containers.search": "Search name or image",
+    "containers.stopped": "Stopped",
+    "dialog.cancel": "Cancel",
+    "dialog.confirm": "Confirm",
+    "dialog.confirmCommand": "Confirm command",
+    "docker.available": "Docker available",
+    "docker.unavailable": "Docker unavailable",
+    "empty.noAgentSummary": "No agent nodes to summarize.",
+    "errors.commandFailed": "Command failed: {message}",
+    "errors.invalidLogin": "Invalid username or password.",
+    "errors.refreshFailed": "Refresh failed: {message}",
+    "errors.sessionExpired": "Session expired. Sign in again.",
+    "errors.signInFailed": "Sign in failed.",
+    "header.eyebrow": "Distributed Monitoring",
+    "header.title": "Server Dashboard",
+    "insights.auditFailures": "Failures",
+    "insights.auditSecurity": "Security",
+    "insights.auditSources": "Sources",
+    "insights.auditVisible": "Visible Logs",
+    "insights.awaitingAgent": "awaiting agent",
+    "insights.commandsActive": "In flight",
+    "insights.commandsProblem": "Problem",
+    "insights.commandsSuccess": "Success",
+    "insights.commandsTotal": "Total",
+    "insights.containersHot": "Hot CPU",
+    "insights.containersRunning": "Running",
+    "insights.containersStopped": "Stopped",
+    "insights.containersVisible": "Visible",
+    "insights.currentNode": "current node",
+    "insights.failedTimeout": "failed / timeout",
+    "insights.filteredResult": "filtered result",
+    "insights.memoryUsed": "{value} used",
+    "insights.needsAttention": "needs attention",
+    "insights.recentWindow": "recent window",
+    "insights.reviewFailures": "review first",
+    "insights.scopeAll": "all nodes",
+    "insights.scopeNode": "{node}",
+    "insights.securityEvents": "security events",
+    "insights.uniqueClients": "unique clients",
+    "page.auditTitle": "Audit Logs",
+    "page.commandsTitle": "Commands",
+    "page.containersTitle": "Containers",
+    "page.overviewTitle": "Server Dashboard",
+    "login.hint": "Development account: admin / dev-admin-password",
+    "login.password": "Password",
+    "login.signIn": "Sign in",
+    "login.subtitle": "Linux and Docker control plane",
+    "login.username": "Username",
+    "metrics.avgMax": "Avg {avg} / Max {max}",
+    "metrics.cpu": "CPU",
+    "metrics.disk": "Disk",
+    "metrics.memory": "Memory",
+    "metrics.peak": "Peak {time}",
+    "metrics.samples": "Samples: {count}",
+    "metrics.tooltip": "{label}: avg {avg} / max {max} / peak {peak}",
+    "nav.audit": "Audit",
+    "nav.commands": "Commands",
+    "nav.containers": "Containers",
+    "nav.overview": "Overview",
+    "nav.short": "Nav",
+    "node.alertCount": "{count} alerts",
+    "node.available": "available",
+    "node.lastSeen": "last seen {time}",
+    "node.never": "never",
+    "node.none": "No agents connected yet.",
+    "node.unknown": "unknown",
+    "node.unknownHost": "unknown host",
+    "node.unknownNode": "unknown-node",
+    "node.unknownOs": "unknown os",
+    "node.unavailable": "unavailable",
+    "nodes.noneSelected": "No node selected",
+    "nodes.waiting": "Waiting for an agent connection",
+    "panels.auditLogs": "Audit Logs",
+    "panels.commands": "Commands",
+    "panels.containers": "Containers",
+    "panels.nodes": "Nodes",
+    "readonly.role": "Read-only role",
+    "sidebar.collapse": "Collapse navigation",
+    "sidebar.expand": "Expand navigation",
+    "sidebar.realtime": "Realtime",
+    "stats.commands": "Commands",
+    "stats.containers": "Containers",
+    "stats.healthyConnections": "healthy connections",
+    "stats.online": "Online",
+    "stats.recentOperations": "recent operations",
+    "stats.registeredAgents": "registered agents",
+    "stats.totalNodes": "Total Nodes",
+    "stats.visibleContainers": "visible containers",
+    "table.actions": "Actions",
+    "table.image": "Image",
+    "table.name": "Name",
+    "table.status": "Status",
+    "theme.dark": "Dark",
+    "theme.light": "Light",
+    "toasts.commandSubmitted": "Command submitted.",
+    "toasts.signedOut": "Signed out.",
+    "toasts.thresholdsLocal": "Thresholds were kept locally.",
+    "user.signedInAs": "Signed in as {username}{suffix}",
+    "ws.connected": "connected",
+    "ws.connecting": "connecting",
+    "ws.disconnected": "disconnected",
+  },
+  zh: {
+    "actions.refresh": "刷新",
+    "actions.restart": "重启",
+    "actions.start": "启动",
+    "actions.stop": "停止",
+    "alerts.active": "活跃",
+    "alerts.alert": "告警",
+    "alerts.none": "暂无告警。",
+    "alerts.resolved": "已恢复",
+    "alerts.title": "告警",
+    "audit.action": "操作",
+    "audit.exportCsv": "导出 CSV",
+    "audit.node": "节点",
+    "audit.none": "暂无审计日志。",
+    "auth.signOut": "退出登录",
+    "brand.subtitle": "控制平面",
+    "chart.noMetrics": "暂无指标",
+    "chart.resetZoom": "重置缩放",
+    "commands.confirmMessage": "确认对节点 {node} 上的容器 {container} 执行 {action}？命令会立即发送。",
+    "commands.none": "暂无命令。",
+    "commands.selectNodeFirst": "请先选择节点。",
+    "containers.allStatuses": "全部状态",
+    "containers.noMatches": "没有匹配当前筛选条件的容器。",
+    "containers.noneVisible": "当前节点暂无可见容器。",
+    "containers.readOnly": "只读",
+    "containers.running": "运行中",
+    "containers.search": "搜索名称或镜像",
+    "containers.stopped": "已停止",
+    "dialog.cancel": "取消",
+    "dialog.confirm": "确认",
+    "dialog.confirmCommand": "确认命令",
+    "docker.available": "Docker 可用",
+    "docker.unavailable": "Docker 不可用",
+    "empty.noAgentSummary": "暂无可汇总的 Agent 节点。",
+    "errors.commandFailed": "命令失败：{message}",
+    "errors.invalidLogin": "用户名或密码错误。",
+    "errors.refreshFailed": "刷新失败：{message}",
+    "errors.sessionExpired": "会话已过期，请重新登录。",
+    "errors.signInFailed": "登录失败。",
+    "header.eyebrow": "分布式监控",
+    "header.title": "服务端仪表盘",
+    "insights.auditFailures": "失败",
+    "insights.auditSecurity": "安全",
+    "insights.auditSources": "来源",
+    "insights.auditVisible": "可见日志",
+    "insights.awaitingAgent": "等待 Agent",
+    "insights.commandsActive": "执行中",
+    "insights.commandsProblem": "异常",
+    "insights.commandsSuccess": "成功",
+    "insights.commandsTotal": "总数",
+    "insights.containersHot": "高 CPU",
+    "insights.containersRunning": "运行中",
+    "insights.containersStopped": "已停止",
+    "insights.containersVisible": "可见",
+    "insights.currentNode": "当前节点",
+    "insights.failedTimeout": "失败 / 超时",
+    "insights.filteredResult": "筛选结果",
+    "insights.memoryUsed": "已用 {value}",
+    "insights.needsAttention": "需要关注",
+    "insights.recentWindow": "近期窗口",
+    "insights.reviewFailures": "优先排查",
+    "insights.scopeAll": "全部节点",
+    "insights.scopeNode": "{node}",
+    "insights.securityEvents": "安全事件",
+    "insights.uniqueClients": "独立来源",
+    "page.auditTitle": "审计日志",
+    "page.commandsTitle": "命令",
+    "page.containersTitle": "容器",
+    "page.overviewTitle": "服务端仪表盘",
+    "login.hint": "开发账号：admin / dev-admin-password",
+    "login.password": "密码",
+    "login.signIn": "登录",
+    "login.subtitle": "Linux 与 Docker 控制平面",
+    "login.username": "用户名",
+    "metrics.avgMax": "平均 {avg} / 最高 {max}",
+    "metrics.cpu": "CPU",
+    "metrics.disk": "磁盘",
+    "metrics.memory": "内存",
+    "metrics.peak": "峰值 {time}",
+    "metrics.samples": "样本：{count}",
+    "metrics.tooltip": "{label}：平均 {avg} / 最高 {max} / 峰值 {peak}",
+    "nav.audit": "审计",
+    "nav.commands": "命令",
+    "nav.containers": "容器",
+    "nav.overview": "概览",
+    "nav.short": "导航",
+    "node.alertCount": "{count} 条告警",
+    "node.available": "可用",
+    "node.lastSeen": "最后在线 {time}",
+    "node.never": "从未",
+    "node.none": "暂无 Agent 连接。",
+    "node.unknown": "未知",
+    "node.unknownHost": "未知主机",
+    "node.unknownNode": "未知节点",
+    "node.unknownOs": "未知系统",
+    "node.unavailable": "不可用",
+    "nodes.noneSelected": "未选择节点",
+    "nodes.waiting": "等待 Agent 连接",
+    "panels.auditLogs": "审计日志",
+    "panels.commands": "命令",
+    "panels.containers": "容器",
+    "panels.nodes": "节点",
+    "readonly.role": "当前角色只读",
+    "sidebar.collapse": "收起导航",
+    "sidebar.expand": "展开导航",
+    "sidebar.realtime": "实时状态",
+    "stats.commands": "命令",
+    "stats.containers": "容器",
+    "stats.healthyConnections": "健康连接",
+    "stats.online": "在线",
+    "stats.recentOperations": "近期操作",
+    "stats.registeredAgents": "已注册 Agent",
+    "stats.totalNodes": "节点总数",
+    "stats.visibleContainers": "可见容器",
+    "table.actions": "操作",
+    "table.image": "镜像",
+    "table.name": "名称",
+    "table.status": "状态",
+    "theme.dark": "深色",
+    "theme.light": "浅色",
+    "toasts.commandSubmitted": "命令已提交。",
+    "toasts.signedOut": "已退出登录。",
+    "toasts.thresholdsLocal": "阈值已保留在本地。",
+    "user.signedInAs": "当前用户 {username}{suffix}",
+    "ws.connected": "已连接",
+    "ws.connecting": "连接中",
+    "ws.disconnected": "已断开",
+  },
+};
+
 els.loginForm.addEventListener("submit", login);
 els.logout.addEventListener("click", () => logout());
+els.sidebarToggle.addEventListener("click", toggleSidebar);
+els.navLinks.forEach((link) => link.addEventListener("click", changePage));
 els.refresh.addEventListener("click", refreshAll);
 els.alertsToggle.addEventListener("click", toggleAlertPanel);
 els.themeToggle.addEventListener("click", toggleTheme);
+els.languageSelect.addEventListener("change", changeLanguage);
 els.metricRange.addEventListener("click", changeMetricRange);
 els.chartZoomReset.addEventListener("click", () => resetMetricZoom());
 els.thresholdCpu.addEventListener("input", () => updateThreshold("cpu", els.thresholdCpu.value));
@@ -107,13 +392,17 @@ els.commandDialogConfirm.addEventListener("click", () => closeCommandDialog(true
 els.commandDialog.addEventListener("click", (event) => {
   if (event.target === els.commandDialog) closeCommandDialog(false);
 });
+window.addEventListener("hashchange", () => setPage(window.location.hash.slice(1) || "overview"));
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !els.commandDialog.classList.contains("is-hidden")) {
     closeCommandDialog(false);
   }
 });
 
+applyLanguage();
 applyTheme();
+applySidebarState();
+applyPage();
 boot();
 
 async function boot() {
@@ -147,7 +436,7 @@ async function login(event) {
       body: JSON.stringify({ username, password }),
     });
     if (!response.ok) {
-      throw new Error("Invalid username or password.");
+      throw new Error(t("errors.invalidLogin"));
     }
     const data = await response.json();
     applyAuthProfile(data);
@@ -157,7 +446,7 @@ async function login(event) {
     await refreshAll();
     state.refreshTimer = setInterval(refreshAll, 5000);
   } catch (error) {
-    showToast(error.message || "Sign in failed.");
+    showToast(error.message || t("errors.signInFailed"));
   }
 }
 
@@ -192,7 +481,7 @@ function logout(showMessage = true) {
   localStorage.removeItem("monitor.sessionToken");
   localStorage.removeItem("monitor.username");
   showLogin();
-  if (showMessage) showToast("Signed out.");
+  if (showMessage) showToast(t("toasts.signedOut"));
 }
 
 function showLogin() {
@@ -203,8 +492,11 @@ function showLogin() {
 function showApp() {
   els.loginView.classList.add("is-hidden");
   els.appView.classList.remove("is-hidden");
+  applyPage();
   const suffix = state.role ? ` / ${state.role}` : "";
-  els.currentUser.textContent = state.username ? `Signed in as ${state.username}${suffix}` : "";
+  els.currentUser.textContent = state.username
+    ? t("user.signedInAs", { username: state.username, suffix })
+    : "";
 }
 
 function toggleTheme() {
@@ -216,7 +508,55 @@ function toggleTheme() {
 
 function applyTheme() {
   document.documentElement.dataset.theme = state.theme;
-  els.themeToggle.textContent = state.theme === "dark" ? "Light" : "Dark";
+  els.themeToggle.textContent = state.theme === "dark" ? t("theme.light") : t("theme.dark");
+}
+
+function toggleSidebar() {
+  state.sidebarCollapsed = !state.sidebarCollapsed;
+  localStorage.setItem("monitor.sidebarCollapsed", state.sidebarCollapsed ? "true" : "false");
+  applySidebarState();
+}
+
+function changePage(event) {
+  event.preventDefault();
+  const page = event.currentTarget.dataset.pageLink;
+  setPage(page);
+}
+
+function setPage(page) {
+  const nextPage = normalizePage(page);
+  state.currentPage = nextPage;
+  localStorage.setItem("monitor.currentPage", nextPage);
+  if (window.location.hash !== `#${nextPage}`) {
+    window.history.replaceState(null, "", `#${nextPage}`);
+  }
+  applyPage();
+}
+
+function applyPage() {
+  const currentPage = normalizePage(state.currentPage);
+  state.currentPage = currentPage;
+  els.pages.forEach((page) => {
+    page.classList.toggle("is-hidden", page.dataset.page !== currentPage);
+  });
+  els.navLinks.forEach((link) => {
+    const active = link.dataset.pageLink === currentPage;
+    link.classList.toggle("active", active);
+    link.setAttribute("aria-current", active ? "page" : "false");
+  });
+  const titleKey = `page.${currentPage}Title`;
+  els.pageTitle.textContent = t(titleKey);
+  renderChart(metricsForChart());
+}
+
+function applySidebarState() {
+  els.appView.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
+  els.sidebarToggle.setAttribute(
+    "aria-label",
+    state.sidebarCollapsed ? t("sidebar.expand") : t("sidebar.collapse"),
+  );
+  els.sidebarToggle.title = state.sidebarCollapsed ? t("sidebar.expand") : t("sidebar.collapse");
+  els.sidebarToggle.dataset.label = t("nav.short");
 }
 
 function applyAuthProfile(profile) {
@@ -224,6 +564,42 @@ function applyAuthProfile(profile) {
   state.csrfToken = profile.csrf_token || "";
   state.role = profile.role || "";
   state.scopes = Array.isArray(profile.scopes) ? profile.scopes : [];
+}
+
+function changeLanguage() {
+  state.language = els.languageSelect.value === "zh" ? "zh" : "en";
+  localStorage.setItem("monitor.language", state.language);
+  applyLanguage();
+  applyTheme();
+  applySidebarState();
+  applyPage();
+  if (state.username) {
+    showApp();
+  }
+  renderMetricControls();
+  if (!els.appView.classList.contains("is-hidden")) {
+    render();
+  }
+}
+
+function applyLanguage() {
+  document.documentElement.lang = state.language === "zh" ? "zh-CN" : "en";
+  els.languageSelect.value = state.language;
+  document.querySelectorAll("[data-i18n]").forEach((element) => {
+    element.textContent = t(element.dataset.i18n);
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((element) => {
+    element.placeholder = t(element.dataset.i18nPlaceholder);
+  });
+  document.querySelectorAll("[data-i18n-title]").forEach((element) => {
+    element.title = t(element.dataset.i18nTitle);
+  });
+}
+
+function t(key, values = {}) {
+  const table = translations[state.language] || translations.en;
+  const template = table[key] || translations.en[key] || key;
+  return template.replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? ""));
 }
 
 async function api(path, options = {}) {
@@ -238,7 +614,7 @@ async function api(path, options = {}) {
   });
   if (response.status === 401) {
     logout(false);
-    throw new Error("Session expired. Sign in again.");
+    throw new Error(t("errors.sessionExpired"));
   }
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
@@ -282,10 +658,10 @@ function connectWs() {
       return;
     }
     if (message?.type === "alert_created") {
-      showToast(alertTitle(message.alert, "Alert"));
+      showToast(alertTitle(message.alert, t("alerts.alert")));
     }
     if (message?.type === "alert_resolved") {
-      showToast(alertTitle(message.alert, "Resolved"));
+      showToast(alertTitle(message.alert, t("alerts.resolved")));
     }
     if (message?.type === "thresholds_updated" && message.thresholds) {
       state.thresholds = normalizeThresholdPayload(message.thresholds);
@@ -298,7 +674,7 @@ function connectWs() {
 }
 
 function setWsState(value) {
-  els.wsState.textContent = value;
+  els.wsState.textContent = t(`ws.${value}`);
 }
 
 async function refreshAll() {
@@ -333,7 +709,7 @@ async function refreshAll() {
     state.metrics = state.metricPayload?.points || [];
     render();
   } catch (error) {
-    showToast(`Refresh failed: ${error.message}`);
+    showToast(t("errors.refreshFailed", { message: error.message }));
   }
 }
 
@@ -353,6 +729,7 @@ function selectNode(nodeId, shouldRefresh = true) {
 function render() {
   renderOverview();
   renderAlerts();
+  renderPageInsights();
   renderNodes();
   renderSelectedNode();
   renderMetricControls();
@@ -360,6 +737,63 @@ function render() {
   renderChart(metricsForChart());
   renderContainers();
   renderEvents();
+}
+
+function renderPageInsights() {
+  renderContainerInsights();
+  renderCommandInsights();
+  renderAuditInsights();
+}
+
+function renderContainerInsights() {
+  const running = state.containers.filter((container) => String(container.status || "").toLowerCase() === "running").length;
+  const stopped = state.containers.length - running;
+  const cpuThreshold = Number(state.thresholds.cpu ?? 80);
+  const hot = state.containers.filter((container) => Number(container.cpu_percent || 0) >= cpuThreshold).length;
+  const memoryUsed = state.containers.reduce((total, container) => total + Number(container.memory_usage || 0), 0);
+  const selectedNode = state.nodes.find((node) => node.id === state.selectedNodeId);
+
+  els.containersTotal.textContent = state.containers.length;
+  els.containersRunningCount.textContent = running;
+  els.containersStoppedCount.textContent = stopped;
+  els.containersHotCount.textContent = hot;
+  els.containersMemoryTotal.textContent = t("insights.memoryUsed", { value: bytes(memoryUsed) });
+  els.containersScope.textContent = selectedNode
+    ? t("insights.scopeNode", { node: selectedNode.name || selectedNode.id })
+    : t("insights.scopeAll");
+}
+
+function renderCommandInsights() {
+  const activeStatuses = new Set(["pending", "sent", "acknowledged", "running"]);
+  const problemStatuses = new Set(["failed", "timeout"]);
+  const success = state.commands.filter((command) => command.status === "success").length;
+  const active = state.commands.filter((command) => activeStatuses.has(command.status)).length;
+  const problem = state.commands.filter((command) => problemStatuses.has(command.status)).length;
+  const latest = state.commands[0];
+
+  els.commandsTotal.textContent = state.commands.length;
+  els.commandsSuccessCount.textContent = success;
+  els.commandsActiveCount.textContent = active;
+  els.commandsProblemCount.textContent = problem;
+  els.commandsLatestStatus.textContent = latest ? `${latest.action} / ${latest.status}` : "-";
+}
+
+function renderAuditInsights() {
+  const security = state.auditLogs.filter((item) => String(item.event_type || "").includes("security")).length;
+  const failures = state.auditLogs.filter((item) => {
+    const result = String(item.result || "").toLowerCase();
+    return result && !["success", "ok", "allowed"].includes(result);
+  }).length;
+  const sources = new Set(
+    state.auditLogs
+      .map((item) => String(item.client_ip || "").trim())
+      .filter(Boolean),
+  );
+
+  els.auditTotal.textContent = state.auditLogs.length;
+  els.auditSecurityCount.textContent = security;
+  els.auditSourceCount.textContent = sources.size;
+  els.auditFailureCount.textContent = failures;
 }
 
 function renderOverview() {
@@ -373,7 +807,7 @@ function renderOverview() {
 function renderNodeOverview() {
   els.nodeOverview.replaceChildren();
   if (!state.nodes.length) {
-    els.nodeOverview.appendChild(createTextBlock("div", "empty", "No agent nodes to summarize."));
+    els.nodeOverview.appendChild(createTextBlock("div", "empty", t("empty.noAgentSummary")));
     return;
   }
 
@@ -387,14 +821,14 @@ function renderNodeOverview() {
     const header = document.createElement("span");
     header.className = "node-overview-header";
     header.append(
-      createTextBlock("strong", "", node.name || node.id || "unknown-node"),
-      createTextBlock("span", `status-chip ${statusClass(node.status)}`, node.status || "unknown"),
+      createTextBlock("strong", "", node.name || node.id || t("node.unknownNode")),
+      createTextBlock("span", `status-chip ${statusClass(node.status)}`, node.status || t("node.unknown")),
     );
 
     const meta = createTextBlock(
       "span",
       "node-overview-meta",
-      `${node.hostname || "unknown host"} / ${node.os || "unknown os"}`,
+      `${node.hostname || t("node.unknownHost")} / ${node.os || t("node.unknownOs")}`,
     );
 
     const rings = document.createElement("span");
@@ -409,8 +843,8 @@ function renderNodeOverview() {
     const footer = document.createElement("span");
     footer.className = "node-overview-footer";
     footer.append(
-      createTextBlock("span", "", node.docker_available ? "Docker available" : "Docker unavailable"),
-      createTextBlock("span", nodeAlerts.length ? "alert-mini active" : "alert-mini", `${nodeAlerts.length} alerts`),
+      createTextBlock("span", "", node.docker_available ? t("docker.available") : t("docker.unavailable")),
+      createTextBlock("span", nodeAlerts.length ? "alert-mini active" : "alert-mini", t("node.alertCount", { count: nodeAlerts.length })),
     );
 
     card.append(header, meta, rings, footer);
@@ -437,14 +871,14 @@ function renderAlerts() {
   els.alertsToggle.classList.toggle("has-alerts", active.length > 0);
   els.alertPanel.replaceChildren();
   if (!state.alerts.length) {
-    els.alertPanel.appendChild(createTextBlock("div", "empty", "No alerts."));
+    els.alertPanel.appendChild(createTextBlock("div", "empty", t("alerts.none")));
     return;
   }
   state.alerts.slice(0, 8).forEach((alert) => {
     const item = document.createElement("div");
     item.className = `alert-item ${statusClass(alert.status)}`;
     item.append(
-      createTextBlock("strong", "", alertTitle(alert, alert.status === "active" ? "Active" : "Resolved")),
+      createTextBlock("strong", "", alertTitle(alert, alert.status === "active" ? t("alerts.active") : t("alerts.resolved"))),
       createTextBlock("span", "", `${formatDateTime(alert.triggered_at)} / value ${percent(alert.value)}`),
     );
     els.alertPanel.appendChild(item);
@@ -466,7 +900,7 @@ function renderMetricControls() {
   els.thresholdDisk.value = state.thresholds.disk ?? "";
   [els.thresholdCpu, els.thresholdMemory, els.thresholdDisk].forEach((input) => {
     input.disabled = !canManageThresholds;
-    input.title = canManageThresholds ? "" : "Read-only role";
+    input.title = canManageThresholds ? "" : t("readonly.role");
   });
 }
 
@@ -548,7 +982,7 @@ async function loadServerThresholds() {
 function scheduleThresholdSave() {
   clearTimeout(state.thresholdSaveTimer);
   state.thresholdSaveTimer = setTimeout(() => {
-    saveThresholds().catch(() => showToast("Thresholds were kept locally."));
+    saveThresholds().catch(() => showToast(t("toasts.thresholdsLocal")));
   }, 450);
 }
 
@@ -563,17 +997,17 @@ function renderMetricSummary() {
   els.metricSummary.replaceChildren();
   const summary = state.metricZoom ? summarizeMetrics(metricsForChart()) : state.metricPayload?.summary;
   const items = [
-    ["CPU", summary?.cpu],
-    ["Memory", summary?.memory],
-    ["Disk", summary?.disk],
+    [t("metrics.cpu"), summary?.cpu],
+    [t("metrics.memory"), summary?.memory],
+    [t("metrics.disk"), summary?.disk],
   ];
   items.forEach(([label, item]) => {
     const card = document.createElement("div");
     card.className = "summary-item";
     card.append(
       createTextBlock("span", "", label),
-      createTextBlock("strong", "", `Avg ${percent(item?.avg)} / Max ${percent(item?.max)}`),
-      createTextBlock("em", "", `Peak ${formatDateTime(item?.peak_at)}`),
+      createTextBlock("strong", "", t("metrics.avgMax", { avg: percent(item?.avg), max: percent(item?.max) })),
+      createTextBlock("em", "", t("metrics.peak", { time: formatDateTime(item?.peak_at) })),
     );
     els.metricSummary.appendChild(card);
   });
@@ -582,7 +1016,7 @@ function renderMetricSummary() {
 function renderNodes() {
   els.nodes.replaceChildren();
   if (!state.nodes.length) {
-    els.nodes.appendChild(createTextBlock("div", "empty", "No agents connected yet."));
+    els.nodes.appendChild(createTextBlock("div", "empty", t("node.none")));
     return;
   }
 
@@ -597,13 +1031,13 @@ function renderNodes() {
     nameRow.className = "node-name-row";
     nameRow.append(
       createTextBlock("span", "node-name", node.name || node.id),
-      createTextBlock("span", `status-chip ${statusClass(node.status)}`, node.status || "unknown"),
+      createTextBlock("span", `status-chip ${statusClass(node.status)}`, node.status || t("node.unknown")),
     );
 
     const meta = createTextBlock(
       "span",
       "node-meta",
-      `${node.hostname || "unknown host"} / ${node.os || "unknown os"}`,
+      `${node.hostname || t("node.unknownHost")} / ${node.os || t("node.unknownOs")}`,
     );
 
     const metricRow = document.createElement("span");
@@ -622,9 +1056,9 @@ function renderNodes() {
 function renderSelectedNode() {
   const node = state.nodes.find((item) => item.id === state.selectedNodeId);
   if (!node) {
-    els.title.textContent = "No node selected";
-    els.meta.textContent = "Waiting for an agent connection";
-    els.status.textContent = "unknown";
+    els.title.textContent = t("nodes.noneSelected");
+    els.meta.textContent = t("nodes.waiting");
+    els.status.textContent = t("node.unknown");
     els.status.className = "status-chip neutral";
     els.miniCpu.textContent = "-";
     els.miniMemory.textContent = "-";
@@ -634,13 +1068,13 @@ function renderSelectedNode() {
   }
 
   els.title.textContent = node.name || node.id;
-  els.meta.textContent = `${node.id} / ${node.hostname || "unknown host"} / last seen ${node.last_seen || "never"}`;
-  els.status.textContent = node.status || "unknown";
+  els.meta.textContent = `${node.id} / ${node.hostname || t("node.unknownHost")} / ${t("node.lastSeen", { time: node.last_seen || t("node.never") })}`;
+  els.status.textContent = node.status || t("node.unknown");
   els.status.className = `status-chip ${statusClass(node.status)}`;
   els.miniCpu.textContent = percent(node.latest_cpu_percent);
   els.miniMemory.textContent = percent(node.latest_memory_percent);
   els.miniDisk.textContent = percent(node.latest_disk_percent);
-  els.miniDocker.textContent = node.docker_available ? node.docker_version || "available" : "unavailable";
+  els.miniDocker.textContent = node.docker_available ? node.docker_version || t("node.available") : t("node.unavailable");
 }
 
 function renderChart(metrics) {
@@ -694,7 +1128,7 @@ function renderChart(metrics) {
   if (!metrics.length) {
     ctx.fillStyle = colors.text;
     ctx.font = "14px system-ui";
-    ctx.fillText("No metrics yet", left, 86);
+    ctx.fillText(t("chart.noMetrics"), left, 86);
     return;
   }
 
@@ -959,12 +1393,12 @@ function formatAxisLabel(value) {
   if (Number.isNaN(date.getTime())) return String(value);
 
   if (state.metricRange === "1h") {
-    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return date.toLocaleTimeString(locale(), { hour: "2-digit", minute: "2-digit" });
   }
   if (state.metricRange === "7d") {
-    return date.toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit" });
+    return date.toLocaleString(locale(), { month: "2-digit", day: "2-digit", hour: "2-digit" });
   }
-  return date.toLocaleDateString([], { month: "2-digit", day: "2-digit" });
+  return date.toLocaleDateString(locale(), { month: "2-digit", day: "2-digit" });
 }
 
 function yForValue(value, top, bottom) {
@@ -976,7 +1410,7 @@ function renderContainers() {
   els.containers.replaceChildren();
   if (!state.containers.length) {
     const row = document.createElement("tr");
-    const cell = createTextBlock("td", "empty", "No visible containers on the selected node.");
+    const cell = createTextBlock("td", "empty", t("containers.noneVisible"));
     cell.colSpan = 6;
     row.appendChild(cell);
     els.containers.appendChild(row);
@@ -986,7 +1420,7 @@ function renderContainers() {
   const filtered = state.containers.filter(containerMatchesFilters);
   if (!filtered.length) {
     const row = document.createElement("tr");
-    const cell = createTextBlock("td", "empty", "No containers match the current filters.");
+    const cell = createTextBlock("td", "empty", t("containers.noMatches"));
     cell.colSpan = 6;
     row.appendChild(cell);
     els.containers.appendChild(row);
@@ -1022,16 +1456,16 @@ function renderContainers() {
 function createContainerActions(container) {
   const actions = document.createElement("td");
   if (!hasScope("commands:create")) {
-    actions.appendChild(createTextBlock("span", "status-chip neutral", "read only"));
+    actions.appendChild(createTextBlock("span", "status-chip neutral", t("containers.readOnly")));
     return actions;
   }
 
   const actionRow = document.createElement("div");
   actionRow.className = "action-row";
   actionRow.append(
-    createActionButton("Start", "container.start", container),
-    createActionButton("Stop", "container.stop", container, "danger"),
-    createActionButton("Restart", "container.restart", container),
+    createActionButton(t("actions.start"), "container.start", container),
+    createActionButton(t("actions.stop"), "container.stop", container, "danger"),
+    createActionButton(t("actions.restart"), "container.restart", container),
   );
   actions.appendChild(actionRow);
   return actions;
@@ -1073,7 +1507,7 @@ function createActionButton(label, action, container, className = "") {
 
 async function sendCommand(action, containerId) {
   if (!state.selectedNodeId) {
-    showToast("Select a node first.");
+    showToast(t("commands.selectNodeFirst"));
     return;
   }
   const confirmed = await confirmCommand(action, containerId);
@@ -1087,25 +1521,30 @@ async function sendCommand(action, containerId) {
         payload: { container_id: containerId },
       }),
     });
-    showToast("Command submitted.");
+    showToast(t("toasts.commandSubmitted"));
     await refreshAll();
   } catch (error) {
-    showToast(`Command failed: ${error.message}`);
+    showToast(t("errors.commandFailed", { message: error.message }));
   }
 }
 
 function confirmCommand(action, containerId) {
   const container = state.containers.find((item) => String(item.container_id) === String(containerId));
   const node = state.nodes.find((item) => item.id === state.selectedNodeId);
-  const actionLabel = action.replace("container.", "");
+  const actionKey = action.replace("container.", "");
+  const actionLabel = t(`actions.${actionKey}`);
   const containerLabel = container?.name || containerId;
   const nodeLabel = node?.name || state.selectedNodeId;
   const destructive = action.endsWith(".stop") || action.endsWith(".restart");
   if (commandDialogResolve) {
     closeCommandDialog(false);
   }
-  els.commandDialogMessage.textContent = `Confirm ${actionLabel} for container ${containerLabel} on node ${nodeLabel}. This command will be sent immediately.`;
-  els.commandDialogConfirm.textContent = actionLabel.charAt(0).toUpperCase() + actionLabel.slice(1);
+  els.commandDialogMessage.textContent = t("commands.confirmMessage", {
+    action: actionLabel,
+    container: containerLabel,
+    node: nodeLabel,
+  });
+  els.commandDialogConfirm.textContent = actionLabel;
   els.commandDialogConfirm.className = destructive ? "danger" : "";
   els.commandDialog.classList.remove("is-hidden");
   els.commandDialogConfirm.focus();
@@ -1128,14 +1567,14 @@ function renderEvents() {
     state.commands,
     (item) => `${item.action} / ${item.status}`,
     (item) => `${item.node_id} / ${item.created_at} / ${item.result_message || ""}`,
-    "No commands yet.",
+    t("commands.none"),
   );
   renderEventList(
     els.auditLogs,
     state.auditLogs,
     (item) => `${item.action} / ${item.result || ""}`,
     (item) => `${item.user} / ${item.node_id || "-"} / ${item.client_ip || "-"} / ${item.created_at}`,
-    "No audit logs yet.",
+    t("audit.none"),
   );
 }
 
@@ -1224,10 +1663,10 @@ function showChartTooltip(event) {
   const point = nearest.point;
   els.chartTooltip.replaceChildren(
     createTextBlock("strong", "", formatBucket(point)),
-    createTextBlock("span", "", `Samples: ${point.sample_count || 0}`),
-    createTextBlock("span", "", metricTooltipLine("CPU", point.cpu_avg, point.cpu_max, point.cpu_peak_at)),
-    createTextBlock("span", "", metricTooltipLine("Memory", point.memory_avg, point.memory_max, point.memory_peak_at)),
-    createTextBlock("span", "", metricTooltipLine("Disk", point.disk_avg, point.disk_max, point.disk_peak_at)),
+    createTextBlock("span", "", t("metrics.samples", { count: point.sample_count || 0 })),
+    createTextBlock("span", "", metricTooltipLine(t("metrics.cpu"), point.cpu_avg, point.cpu_max, point.cpu_peak_at)),
+    createTextBlock("span", "", metricTooltipLine(t("metrics.memory"), point.memory_avg, point.memory_max, point.memory_peak_at)),
+    createTextBlock("span", "", metricTooltipLine(t("metrics.disk"), point.disk_avg, point.disk_max, point.disk_peak_at)),
   );
   els.chartTooltip.classList.remove("is-hidden");
   const tooltipWidth = Math.min(300, Math.max(220, rect.width - 24));
@@ -1244,7 +1683,12 @@ function hideChartTooltip() {
 }
 
 function metricTooltipLine(label, avg, max, peakAt) {
-  return `${label}: avg ${percent(avg)} / max ${percent(max)} / peak ${formatDateTime(peakAt)}`;
+  return t("metrics.tooltip", {
+    label,
+    avg: percent(avg),
+    max: percent(max),
+    peak: formatDateTime(peakAt),
+  });
 }
 
 function formatBucket(point) {
@@ -1258,7 +1702,7 @@ function formatDateTime(value) {
   if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
-  return date.toLocaleString();
+  return date.toLocaleString(locale());
 }
 
 function loadThresholds() {
@@ -1281,6 +1725,31 @@ function loadTheme() {
   const stored = localStorage.getItem("monitor.theme");
   if (stored === "dark" || stored === "light") return stored;
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function loadLanguage() {
+  const stored = localStorage.getItem("monitor.language");
+  if (stored === "zh" || stored === "en") return stored;
+  return navigator.language?.toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+
+function loadPage() {
+  return normalizePage(window.location.hash.slice(1) || localStorage.getItem("monitor.currentPage"));
+}
+
+function normalizePage(page) {
+  const allowed = new Set(["overview", "containers", "commands", "audit"]);
+  return allowed.has(page) ? page : "overview";
+}
+
+function loadSidebarCollapsed() {
+  const stored = localStorage.getItem("monitor.sidebarCollapsed");
+  if (stored === "false") return false;
+  return true;
+}
+
+function locale() {
+  return state.language === "zh" ? "zh-CN" : "en";
 }
 
 function chartColors() {

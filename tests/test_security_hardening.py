@@ -850,6 +850,76 @@ def test_frontend_has_node_overview_dashboard_cards() -> None:
     assert "conic-gradient" in styles
 
 
+def test_frontend_supports_collapsible_sidebar_navigation() -> None:
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    markup = Path("web/index.html").read_text(encoding="utf-8")
+    styles = Path("web/styles.css").read_text(encoding="utf-8")
+
+    assert 'id="sidebar-toggle"' in markup
+    assert "monitor.sidebarCollapsed" in script
+    assert "toggleSidebar" in script
+    assert "applySidebarState" in script
+    assert 'stored === "false"' in script
+    assert "sidebar-collapsed" in styles
+    assert ".app-shell.sidebar-collapsed" in styles
+    assert "translateX(-100%)" in styles
+    assert "content: attr(data-label)" in styles
+    assert "dataset.label" in script
+
+
+def test_frontend_navigation_switches_independent_pages() -> None:
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    markup = Path("web/index.html").read_text(encoding="utf-8")
+    styles = Path("web/styles.css").read_text(encoding="utf-8")
+
+    assert 'data-page-link="overview"' in markup
+    assert 'data-page="containers"' in markup
+    assert 'data-page="commands"' in markup
+    assert 'data-page="audit"' in markup
+    assert "currentPage: loadPage()" in script
+    assert "changePage" in script
+    assert "applyPage" in script
+    assert "hashchange" in script
+    assert "monitor.currentPage" in script
+    assert ".app-page" in styles
+    assert "grid-template-columns: minmax(0, 1fr)" in styles
+
+
+def test_frontend_pages_have_operational_insight_cards() -> None:
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    markup = Path("web/index.html").read_text(encoding="utf-8")
+    styles = Path("web/styles.css").read_text(encoding="utf-8")
+
+    assert 'id="containers-running-count"' in markup
+    assert 'id="containers-memory-total"' in markup
+    assert 'id="commands-active-count"' in markup
+    assert 'id="commands-problem-count"' in markup
+    assert 'id="audit-security-count"' in markup
+    assert 'id="audit-source-count"' in markup
+    assert "renderPageInsights" in script
+    assert "renderContainerInsights" in script
+    assert "renderCommandInsights" in script
+    assert "renderAuditInsights" in script
+    assert ".page-insights" in styles
+    assert ".insight-card" in styles
+
+
+def test_frontend_supports_language_switching() -> None:
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    markup = Path("web/index.html").read_text(encoding="utf-8")
+    styles = Path("web/styles.css").read_text(encoding="utf-8")
+
+    assert 'id="language-select"' in markup
+    assert 'data-i18n="header.title"' in markup
+    assert 'data-i18n-placeholder="containers.search"' in markup
+    assert "const translations" in script
+    assert "monitor.language" in script
+    assert "applyLanguage" in script
+    assert "changeLanguage" in script
+    assert "language-select" in styles
+    assert "中文" in markup
+
+
 def test_frontend_has_container_search_and_status_filters() -> None:
     script = Path("web/app.js").read_text(encoding="utf-8")
     markup = Path("web/index.html").read_text(encoding="utf-8")
