@@ -12,13 +12,14 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from agent.monitor_agent.client import MonitorAgent
-from agent.monitor_agent.config import AgentConfig
+from agent.monitor_agent.config import AgentConfig, load_agent_config
 from agent.monitor_agent.collectors.docker_collector import DockerCollector
 from server.monitor_server.app import _handle_agent_message, create_app
 from server.monitor_server.config import AgentCredential, ApiTokenConfig, ServerConfig, UserConfig, load_server_config
 from server.monitor_server.db import Database
 from server.monitor_server.doctor import format_doctor_report, run_config_doctor
 from server.monitor_server.hub import ConnectionHub
+from server.monitor_server.init_config import write_init_config_files
 from server.monitor_server.security import hash_secret, verify_secret
 
 
@@ -694,6 +695,50 @@ def test_config_doctor_reports_runtime_config_errors(tmp_path: Path) -> None:
     assert {"admin_password_hash", "users", "agents", "roles"} <= error_names
 
 
+def test_init_config_wizard_writes_hardened_server_and_agent_configs(tmp_path: Path) -> None:
+    server_path = tmp_path / "server.yaml"
+    agent_path = tmp_path / "agent.yaml"
+
+    result = write_init_config_files(
+        server_config_path=server_path,
+        agent_config_path=agent_path,
+        admin_username="admin",
+        admin_password="admin-password",
+        agent_id="dev-agent",
+        agent_token="agent-token",
+    )
+
+    assert result.server_config_path == server_path
+    assert result.agent_config_path == agent_path
+
+    server_text = server_path.read_text(encoding="utf-8")
+    assert "admin-password" not in server_text
+    assert "agent-token" not in server_text
+    assert "admin_password:" not in server_text
+    assert "admin_password_hash:" in server_text
+    assert "token_hash:" in server_text
+
+    cfg = load_server_config(str(server_path))
+    assert verify_secret("admin-password", cfg.admin_password_hash)
+    assert verify_secret("agent-token", cfg.agents[0].token_hash)
+    assert cfg.admin_token == ""
+
+    agent_cfg = load_agent_config(str(agent_path))
+    assert agent_cfg.server_url == "ws://127.0.0.1:8000/agent/ws"
+    assert agent_cfg.agent_id == "dev-agent"
+    assert agent_cfg.token == "agent-token"
+    assert agent_cfg.docker.allowed_labels == {"monitor.control-plane.allow": "true"}
+
+    with pytest.raises(FileExistsError):
+        write_init_config_files(
+            server_config_path=server_path,
+            agent_config_path=agent_path,
+            admin_username="admin",
+            admin_password="admin-password",
+            agent_id="dev-agent",
+        )
+
+
 def test_duplicate_agent_registration_rejected() -> None:
     async def run() -> None:
         hub = ConnectionHub()
@@ -997,6 +1042,22 @@ def test_deployment_artifacts_are_hardened_by_default() -> None:
     assert "OnCalendar=daily" in backup_timer
     assert ".backup" in backup_script
     assert "PRAGMA integrity_check" in backup_script
+
+
+def test_ui_smoke_check_script_exercises_real_browser_flow() -> None:
+    wrapper = Path("scripts/ui_smoke_check.ps1").read_text(encoding="utf-8")
+    script = Path("scripts/ui_smoke_check.mjs").read_text(encoding="utf-8")
+
+    assert "Get-Command npx" in wrapper
+    assert "--package" in wrapper
+    assert "playwright" in wrapper
+    assert "chromium.launch" in script
+    assert "#login-username" in script
+    assert "#login-password" in script
+    assert "data-page-link" in script
+    assert "language-select" in script
+    assert "theme-toggle" in script
+    assert "setViewportSize" in script
 
 
 def test_yaml_artifacts_parse() -> None:

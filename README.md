@@ -68,15 +68,31 @@ python -m venv .venv
 ### 2. 创建本地配置
 
 ```powershell
-Copy-Item server.example.yaml server.yaml
-Copy-Item agent.example.yaml agent.yaml
+.\.venv\Scripts\python.exe -m server.monitor_server --init-config
+```
+
+向导会提示输入管理员密码，然后生成：
+
+- `server.yaml`：包含管理员 Argon2id 密码哈希、随机 session secret、Agent token hash、角色和安全默认项。
+- `agent.yaml`：包含 Agent 连接地址和明文 Agent token。
+
+默认不会覆盖已有配置。如果你明确要重新生成：
+
+```powershell
+.\.venv\Scripts\python.exe -m server.monitor_server --init-config --force
+```
+
+也可以指定初始 Agent：
+
+```powershell
+.\.venv\Scripts\python.exe -m server.monitor_server --init-config --agent-id dev-agent --agent-name dev-agent
 ```
 
 `server.yaml` 和 `agent.yaml` 已被 `.gitignore` 忽略，不要提交。
 
-### 3. 生成哈希
+### 3. 手动生成哈希
 
-管理员密码、Agent token、API token 都用同一个命令生成 Argon2id 哈希：
+如果不使用向导，管理员密码、Agent token、API token 都用同一个命令生成 Argon2id 哈希：
 
 ```powershell
 .\.venv\Scripts\python.exe -m server.monitor_server --hash-secret "your-admin-password"
@@ -262,6 +278,15 @@ node --check web/app.js
 .\.venv\Scripts\python.exe -m pip_audit -r requirements.txt
 ```
 
+如果已启动 Server，也可以运行真实浏览器 UI smoke check：
+
+```powershell
+$env:MONITOR_UI_PASSWORD = "your-admin-password"
+.\scripts\ui_smoke_check.ps1 -BaseUrl http://127.0.0.1:8000 -Username admin
+```
+
+这个脚本会用 Playwright 打开真实 Chromium，覆盖登录、页面切换、语言切换、主题切换和移动端宽度。它需要本机有 Node.js/npm 提供的 `npx`；如果缺少，脚本会提示安装方式。
+
 当前测试覆盖重点：
 
 - 明文密码和旧 hash 拒绝启动。
@@ -275,6 +300,7 @@ node --check web/app.js
 - 命令 ACK/running/result/timeout 状态机。
 - SQLite WAL、metrics rollup、告警创建/恢复。
 - WebUI 页面切换、语言切换、操作确认、容器筛选、图表缩放。
+- 可选真实浏览器 smoke check 脚本。
 
 ## CI 与部署材料
 
@@ -291,6 +317,8 @@ node --check web/app.js
 - `docs/deployment.md`
 - `scripts/backup_sqlite.ps1`
 - `scripts/backup_sqlite.sh`
+- `scripts/ui_smoke_check.ps1`
+- `scripts/ui_smoke_check.mjs`
 
 ## 生产部署前检查
 
@@ -312,6 +340,10 @@ node --check web/app.js
 
 ```text
 README.md
+server/monitor_server/__main__.py
+server/monitor_server/init_config.py
+scripts/ui_smoke_check.ps1
+scripts/ui_smoke_check.mjs
 web/index.html
 web/app.js
 web/styles.css

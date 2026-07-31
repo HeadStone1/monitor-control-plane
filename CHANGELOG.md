@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-07-31
+
+### Added
+
+- Added `--init-config` to generate local `server.yaml` and `agent.yaml` with Argon2id hashes, a random session secret, an initial Agent token, RBAC defaults, retention settings, and Docker allowed-label defaults.
+- Added `scripts/ui_smoke_check.ps1` and `scripts/ui_smoke_check.mjs` for optional real-browser WebUI validation with Playwright.
+- Added tests for the config initialization flow and UI smoke-check script coverage.
+
+### Changed
+
+- Updated README quick start to recommend the config initialization wizard before manual hash generation.
+- Documented the optional browser smoke check command and the files that should be included in this update.
+
 ## 2026-05-18
 
 ### Security
