@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -70,6 +72,7 @@ class AgentPayloadLimitConfig:
 @dataclass(slots=True)
 class CommandConfig:
     timeout_seconds: int = 60
+    send_timeout_seconds: int = 5
 
 
 @dataclass(slots=True)
@@ -78,6 +81,27 @@ class RetentionConfig:
     hourly_rollup_days: int = 90
     daily_rollup_days: int = 365
     rollup_interval_seconds: int = 3600
+    maintenance_batch_size: int = 5000
+
+
+@dataclass(slots=True)
+class AlertWebhookConfig:
+    name: str
+    url: str
+    secret_env: str
+    secret: str = field(default="", repr=False)
+    enabled: bool = True
+
+
+@dataclass(slots=True)
+class AlertNotificationConfig:
+    enabled: bool = False
+    queue_size: int = 100
+    worker_count: int = 2
+    request_timeout_seconds: int = 5
+    max_attempts: int = 3
+    retry_base_seconds: int = 2
+    webhooks: list[AlertWebhookConfig] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -118,6 +142,7 @@ class ServerConfig:
     agent_payload_limits: AgentPayloadLimitConfig = field(default_factory=AgentPayloadLimitConfig)
     command: CommandConfig = field(default_factory=CommandConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
+    alert_notifications: AlertNotificationConfig = field(default_factory=AlertNotificationConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 
 
@@ -168,6 +193,16 @@ def _reject_plaintext_passwords(raw: dict[str, Any]) -> None:
         for item in agents_raw:
             if isinstance(item, dict) and str(item.get("token") or "").strip():
                 raise ValueError("Plaintext agents[].token is not supported; use agents[].token_hash")
+
+    notifications_raw = raw.get("alert_notifications")
+    if isinstance(notifications_raw, dict):
+        webhooks_raw = notifications_raw.get("webhooks")
+        if isinstance(webhooks_raw, list):
+            for item in webhooks_raw:
+                if isinstance(item, dict) and str(item.get("secret") or "").strip():
+                    raise ValueError(
+                        "Plaintext alert_notifications.webhooks[].secret is not supported; use secret_env"
+                    )
 
 
 def _require_argon2id_hash(label: str, encoded: str) -> None:
@@ -283,6 +318,122 @@ def _load_api_tokens(raw: dict[str, Any]) -> list[ApiTokenConfig]:
     return tokens
 
 
+def _load_alert_notifications(raw: dict[str, Any], environment: str) -> AlertNotificationConfig:
+    notifications_raw = raw.get("alert_notifications") or {}
+    if not isinstance(notifications_raw, dict):
+        raise ValueError("alert_notifications must be an object")
+
+    enabled = bool(notifications_raw.get("enabled", False))
+    webhooks_raw = notifications_raw.get("webhooks") or []
+    if not isinstance(webhooks_raw, list):
+        raise ValueError("alert_notifications.webhooks must be a list")
+
+    webhooks: list[AlertWebhookConfig] = []
+    names: set[str] = set()
+    for index, item in enumerate(webhooks_raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"alert_notifications.webhooks[{index}] must be an object")
+        name = str(item.get("name") or "").strip()
+        url = str(item.get("url") or "").strip()
+        secret_env = str(item.get("secret_env") or "").strip()
+        webhook_enabled = bool(item.get("enabled", True))
+        if not name or len(name) > 64:
+            raise ValueError(f"alert_notifications.webhooks[{index}].name must be 1-64 characters")
+        if name in names:
+            raise ValueError(f"duplicate alert webhook name: {name}")
+        names.add(name)
+        _validate_webhook_url(url, environment, index)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", secret_env):
+            raise ValueError(
+                f"alert_notifications.webhooks[{index}].secret_env must name an environment variable"
+            )
+        secret = str(os.getenv(secret_env) or "")
+        if enabled and webhook_enabled and not secret:
+            raise ValueError(f"environment variable {secret_env} is required for enabled alert webhook {name}")
+        if enabled and webhook_enabled and not 32 <= len(secret) <= 4096:
+            raise ValueError(
+                f"environment variable {secret_env} must contain a 32-4096 character webhook signing secret"
+            )
+        webhooks.append(
+            AlertWebhookConfig(
+                name=name,
+                url=url,
+                secret_env=secret_env,
+                secret=secret,
+                enabled=webhook_enabled,
+            )
+        )
+
+    notifications = AlertNotificationConfig(
+        enabled=enabled,
+        queue_size=_bounded_int_setting(
+            "alert_notifications.queue_size", notifications_raw.get("queue_size"), 100, 1, 10000
+        ),
+        worker_count=_bounded_int_setting(
+            "alert_notifications.worker_count", notifications_raw.get("worker_count"), 2, 1, 8
+        ),
+        request_timeout_seconds=_bounded_int_setting(
+            "alert_notifications.request_timeout_seconds",
+            notifications_raw.get("request_timeout_seconds"),
+            5,
+            1,
+            30,
+        ),
+        max_attempts=_bounded_int_setting(
+            "alert_notifications.max_attempts", notifications_raw.get("max_attempts"), 3, 1, 5
+        ),
+        retry_base_seconds=_bounded_int_setting(
+            "alert_notifications.retry_base_seconds",
+            notifications_raw.get("retry_base_seconds"),
+            2,
+            1,
+            60,
+        ),
+        webhooks=webhooks,
+    )
+    validate_alert_notification_config(notifications, environment)
+    return notifications
+
+
+def _validate_webhook_url(url: str, environment: str, index: int) -> None:
+    if not url or len(url) > 2048:
+        raise ValueError(f"alert_notifications.webhooks[{index}].url must be 1-2048 characters")
+    parsed = urlsplit(url)
+    if parsed.username or parsed.password:
+        raise ValueError(f"alert_notifications.webhooks[{index}].url must not contain credentials")
+    if parsed.fragment:
+        raise ValueError(f"alert_notifications.webhooks[{index}].url must not contain a fragment")
+    if not parsed.hostname:
+        raise ValueError(f"alert_notifications.webhooks[{index}].url must include a host")
+    if parsed.scheme == "https":
+        return
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if environment.lower() != "production" and parsed.scheme == "http" and parsed.hostname.lower() in local_hosts:
+        return
+    raise ValueError(
+        f"alert_notifications.webhooks[{index}].url must use HTTPS; development only permits HTTP loopback"
+    )
+
+
+def validate_alert_notification_config(config: AlertNotificationConfig, environment: str) -> None:
+    names: set[str] = set()
+    for index, webhook in enumerate(config.webhooks):
+        if not webhook.name or len(webhook.name) > 64:
+            raise ValueError(f"alert_notifications.webhooks[{index}].name must be 1-64 characters")
+        if webhook.name in names:
+            raise ValueError(f"duplicate alert webhook name: {webhook.name}")
+        names.add(webhook.name)
+        _validate_webhook_url(webhook.url, environment, index)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", webhook.secret_env):
+            raise ValueError(
+                f"alert_notifications.webhooks[{index}].secret_env must name an environment variable"
+            )
+        if config.enabled and webhook.enabled and not 32 <= len(webhook.secret) <= 4096:
+            raise ValueError(
+                f"alert webhook {webhook.name} requires a 32-4096 character signing secret"
+            )
+
+
 def load_server_config(path: str | None) -> ServerConfig:
     config_path = Path(path).resolve() if path else None
     base_dir = config_path.parent if config_path else Path.cwd()
@@ -294,6 +445,7 @@ def load_server_config(path: str | None) -> ServerConfig:
 
     _reject_plaintext_passwords(raw)
 
+    environment = str(_env("MONITOR_ENV", raw.get("environment", "development")))
     heartbeat_raw = raw.get("heartbeat") or {}
     rate_limit_raw = raw.get("auth_rate_limit") or {}
     payload_limit_raw = raw.get("agent_payload_limits") or {}
@@ -310,7 +462,7 @@ def load_server_config(path: str | None) -> ServerConfig:
         config_path=config_path,
         host=str(_env("MONITOR_HOST", raw.get("host", "127.0.0.1"))),
         port=int(_env("MONITOR_PORT", raw.get("port", 8000))),
-        environment=str(_env("MONITOR_ENV", raw.get("environment", "development"))),
+        environment=environment,
         allowed_hosts=_env_list("MONITOR_ALLOWED_HOSTS", allowed_hosts),
         database_path=_resolve_path(
             _env("MONITOR_DATABASE_PATH", raw.get("database_path", "data/monitor.db")),
@@ -342,15 +494,46 @@ def load_server_config(path: str | None) -> ServerConfig:
             max_string_length=int(payload_limit_raw.get("max_string_length", 256)),
             max_ports_entries=int(payload_limit_raw.get("max_ports_entries", 64)),
         ),
-        command=CommandConfig(timeout_seconds=int(command_raw.get("timeout_seconds", 60))),
+        command=CommandConfig(
+            timeout_seconds=_bounded_int_setting(
+                "command.timeout_seconds", command_raw.get("timeout_seconds"), 60, 1, 3600
+            ),
+            send_timeout_seconds=_bounded_int_setting(
+                "command.send_timeout_seconds", command_raw.get("send_timeout_seconds"), 5, 1, 60
+            ),
+        ),
         retention=RetentionConfig(
             raw_metrics_days=int(retention_raw.get("raw_metrics_days", 7)),
             hourly_rollup_days=int(retention_raw.get("hourly_rollup_days", 90)),
             daily_rollup_days=int(retention_raw.get("daily_rollup_days", 365)),
-            rollup_interval_seconds=int(retention_raw.get("rollup_interval_seconds", 3600)),
+            rollup_interval_seconds=_bounded_int_setting(
+                "retention.rollup_interval_seconds",
+                retention_raw.get("rollup_interval_seconds"),
+                3600,
+                60,
+                86400,
+            ),
+            maintenance_batch_size=_bounded_int_setting(
+                "retention.maintenance_batch_size",
+                retention_raw.get("maintenance_batch_size"),
+                5000,
+                100,
+                100000,
+            ),
         ),
+        alert_notifications=_load_alert_notifications(raw, environment),
         heartbeat=HeartbeatConfig(
             warning_after_seconds=int(heartbeat_raw.get("warning_after_seconds", 30)),
             offline_after_seconds=int(heartbeat_raw.get("offline_after_seconds", 60)),
         ),
     )
+
+
+def _bounded_int_setting(name: str, value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value if value is not None else default)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}") from exc
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return parsed

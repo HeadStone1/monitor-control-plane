@@ -25,7 +25,19 @@ class IntervalConfig:
 @dataclass(slots=True)
 class DockerConfig:
     enabled: bool = True
+    api_timeout_seconds: int = 10
+    collection_timeout_seconds: int = 15
+    collection_workers: int = 3
     allowed_labels: dict[str, str] = field(default_factory=lambda: {"monitor.control-plane.allow": "true"})
+
+
+@dataclass(slots=True)
+class ReconnectConfig:
+    initial_seconds: int = 1
+    max_seconds: int = 30
+    stable_reset_seconds: int = 60
+    jitter_percent: int = 20
+    auth_timeout_seconds: int = 5
 
 
 @dataclass(slots=True)
@@ -38,6 +50,20 @@ class AgentConfig:
     allow_insecure_transport: bool = False
     intervals: IntervalConfig = field(default_factory=IntervalConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
+    reconnect: ReconnectConfig = field(default_factory=ReconnectConfig)
+
+
+def _load_reconnect_config(raw: dict[str, Any]) -> ReconnectConfig:
+    reconnect = ReconnectConfig(
+        initial_seconds=_bounded_int(raw.get("initial_seconds"), 1, 1, 60),
+        max_seconds=_bounded_int(raw.get("max_seconds"), 30, 1, 600),
+        stable_reset_seconds=_bounded_int(raw.get("stable_reset_seconds"), 60, 1, 3600),
+        jitter_percent=_bounded_int(raw.get("jitter_percent"), 20, 0, 50),
+        auth_timeout_seconds=_bounded_int(raw.get("auth_timeout_seconds"), 5, 1, 60),
+    )
+    if reconnect.max_seconds < reconnect.initial_seconds:
+        raise ValueError("reconnect.max_seconds must be greater than or equal to reconnect.initial_seconds")
+    return reconnect
 
 
 def load_agent_config(path: str | None) -> AgentConfig:
@@ -50,6 +76,7 @@ def load_agent_config(path: str | None) -> AgentConfig:
 
     intervals_raw = raw.get("intervals") or {}
     docker_raw = raw.get("docker") or {}
+    reconnect_raw = raw.get("reconnect") or {}
     agent_id = str(raw.get("agent_id", "dev-agent"))
 
     return AgentConfig(
@@ -68,12 +95,28 @@ def load_agent_config(path: str | None) -> AgentConfig:
         ),
         docker=DockerConfig(
             enabled=bool(docker_raw.get("enabled", True)),
+            api_timeout_seconds=_bounded_int(docker_raw.get("api_timeout_seconds"), 10, 1, 120),
+            collection_timeout_seconds=_bounded_int(
+                docker_raw.get("collection_timeout_seconds"), 15, 1, 300
+            ),
+            collection_workers=_bounded_int(docker_raw.get("collection_workers"), 3, 1, 8),
             allowed_labels={
                 str(key): str(value)
                 for key, value in (docker_raw.get("allowed_labels") or {"monitor.control-plane.allow": "true"}).items()
             },
         ),
+        reconnect=_load_reconnect_config(reconnect_raw),
     )
+
+
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value if value is not None else default)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"expected an integer between {minimum} and {maximum}") from exc
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(f"expected an integer between {minimum} and {maximum}")
+    return parsed
 
 
 def _check_config_permissions(config_path: Path) -> None:

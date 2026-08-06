@@ -43,13 +43,14 @@ Current mitigations:
 - The repository contains `server.example.yaml` and `agent.example.yaml`.
 - Sensitive server settings can be provided through environment variables.
 - Web sessions use `HttpOnly` and `SameSite=Strict` cookies.
+- Admin passwords, API tokens, and Server-side Agent credentials use Argon2id hashes.
+- Agent credentials are node-bound, support rotation IDs, and can be persistently revoked.
+- Alert webhook signing secrets are resolved from environment variables and are rejected if placed directly in YAML.
 
 Remaining work:
 
-- Store password hashes instead of plaintext passwords.
-- Use per-agent tokens instead of a shared token list.
-- Add token rotation and revocation.
-- Add rate limiting and lockout for repeated failed login attempts.
+- Protect process environment access and rotate credentials after suspected exposure.
+- Use an external secret manager when moving beyond a single-host deployment.
 
 ### Host Header And Request Tampering
 
@@ -59,12 +60,30 @@ Current mitigations:
 - Command actions use a strict allowlist.
 - The server checks that a target container is known on the selected node before sending a command.
 - The agent validates command action and Docker container ID format again before touching Docker.
+- Browser mutations require a session-bound CSRF token.
+- Commands use node-bound IDs, ACK/running/result states, and state-aware expiry.
+- API routes enforce RBAC scopes.
 
 Remaining work:
 
-- Add CSRF tokens for state-changing browser requests.
-- Add command expiry, acknowledgement, and replay protection.
-- Add RBAC before supporting multiple operators.
+- Add explicit command idempotency keys before supporting automatic command retries.
+
+### Outbound Alert Webhooks
+
+Current mitigations:
+
+- Webhook destinations come only from administrator-controlled configuration, never Agent payloads or request parameters.
+- Production destinations must use HTTPS; development HTTP is restricted to loopback hosts.
+- URLs cannot contain credentials or fragments, redirects are disabled, environment proxy settings are ignored, and response bodies are not buffered.
+- Delivery runs in a bounded worker queue with short timeouts and finite retries, outside the Agent metrics ingestion path.
+- Every request is signed with HMAC-SHA256 over the timestamp and exact request body.
+- Success, final failure, and queue overflow are written to the audit log without recording the signing secret.
+
+Operational requirements:
+
+- The receiver must validate `X-Monitor-Signature` using the raw body and reject stale `X-Monitor-Timestamp` values.
+- Keep signing secrets out of YAML, rotate them periodically, and restrict the receiver to expected source networks where practical.
+- Treat internal webhook destinations as trusted infrastructure; DNS and network policy remain deployment responsibilities.
 
 ### 0day Vulnerabilities
 
@@ -90,10 +109,11 @@ For private security reports, contact the repository owner. Do not publish explo
 - Agent tokens must be stored as Argon2id hashes with per-node `agents[].token_hash`; plaintext `agent_tokens`, `MONITOR_AGENT_TOKENS`, and `agents[].token` are rejected.
 - Agent authentication now binds a token to a specific `node_id`; a token for one node cannot claim another node.
 - Runtime config reload updates users, roles, API tokens, and Agent credentials without restarting the Server.
-- Agent credentials can be revoked at runtime; revocation disables the in-memory credential, disconnects the current WebSocket, and writes an audit event.
+- Agent credentials can be revoked persistently; SQLite stores only the credential fingerprint and token ID, rejects the revoked credential after restart or config reload, disconnects the current WebSocket, and writes audit events.
 - Container command delivery now has ACK and running states before the final success/failed result, with state-aware timeout audit records.
 - Metrics are rolled up into hourly and daily summaries to reduce long-range raw-data scans.
 - Threshold settings are stored server-side and generate active/resolved alert events.
+- Active/resolved alert events can be delivered through signed, bounded, non-blocking webhooks with audited failures.
 - Audit logs support node/action/time filtering and WebUI CSV export for incident review.
 - Production mode refuses plaintext admin passwords, plaintext Agent tokens, development defaults, insecure cookies, and missing secure-transport enforcement.
 - Deployment examples include hardened systemd units, daily SQLite backup timer, a non-root Dockerfile, and Docker Compose with the Agent socket mount behind an opt-in profile.

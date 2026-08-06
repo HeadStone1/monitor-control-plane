@@ -31,12 +31,12 @@
 | 配置加载 | Server 支持 YAML + 环境变量；拒绝明文 admin password、明文 Agent token 和非 Argon2id hash。 | `server/monitor_server/config.py`、`tests/test_security_hardening.py`。 | 通过 | 可增加 `config doctor` 命令，启动前一次性检查配置。 |
 | 登录与会话 | Cookie session、CSRF、RBAC scopes、logout、`/api/auth/me` 已实现。 | `server/monitor_server/security.py`、`server/monitor_server/app.py`、前端 `api()` helper、CSRF 测试。 | 通过 | 建议补真实浏览器测试，验证刷新、过期、logout 后 UI 状态。 |
 | Server API | 已有健康检查、节点、指标、容器、命令、审计、告警、阈值、Prometheus、管理接口。 | `server/monitor_server/app.py` 路由列表。 | 通过 | 建议生成 OpenAPI 文档说明和 API token 使用示例。 |
-| Agent WebSocket | Agent 首包 auth，之后发送 hello、heartbeat、metrics、docker_inventory、docker_stats、命令回执。 | `agent/monitor_agent/client.py`、`server/monitor_server/app.py`。 | 通过 | 建议补协议版本协商策略，未来避免 Agent/Server 版本错配。 |
+| Agent WebSocket | Agent 首包 auth，等待 `auth_ok` 和协议版本确认后再发送 hello、heartbeat、metrics、docker_inventory、docker_stats、命令回执；断线使用带抖动的指数退避。 | `agent/monitor_agent/client.py`、`server/monitor_server/app.py`。 | 通过 | 后续发布新协议版本时补充兼容矩阵和升级顺序。 |
 | UI WebSocket | UI 使用 cookie/session auth 接入 `/ws/ui`，接收节点、指标、容器、命令、告警等刷新事件。 | `web/app.js`、`server/monitor_server/app.py`。 | 部分通过 | 目前缺少浏览器端实时推送自动化测试。 |
 | 节点监控 | Server 存节点状态，支持 online/warning/offline，Agent 心跳驱动状态更新。 | `server/monitor_server/db.py`、`_status_watcher()`。 | 通过 | 可在 UI 图表上增加离线时间标记。 |
 | 指标采集与查询 | Agent 上报 CPU、内存、磁盘、load、网络；Server 支持 1h raw、7d hourly、30d daily。 | `agent/monitor_agent/collectors/system.py`、`server/monitor_server/db.py`、rollup 测试。 | 通过 | 可增加更细粒度时间范围和手动刷新/暂停刷新。 |
 | 指标 rollup | `metrics_hourly`、`metrics_daily` 表和后台 rollup 已实现，查询优先读 rollup。 | `server/monitor_server/db.py`、`test_metric_rollup_populates_hourly_and_daily_series`。 | 通过 | 后续可增加 rollup 运行状态页面。 |
-| 阈值与告警 | 阈值服务端持久化，metrics 入库后评估 active/resolved alert，WebUI 显示告警计数。 | `server/monitor_server/db.py`、`web/app.js`、告警测试。 | 通过 | 告警还没有通知渠道，如 webhook、邮件、飞书/钉钉。 |
+| 阈值与告警 | 阈值服务端持久化，metrics 入库后评估 active/resolved alert，WebUI 显示告警计数；可通过带 HMAC 签名的异步 webhook 发送创建/恢复事件。 | `server/monitor_server/db.py`、`server/monitor_server/notifications.py`、`web/app.js`、告警及 webhook 测试。 | 通过 | 邮件、飞书/钉钉可由接收 webhook 的适配服务完成，避免在主进程中增加多套供应商 SDK。 |
 | Docker 清单 | Agent 读取 Docker 容器清单和运行容器 stats，上报到 Server，WebUI 展示。 | `docker_collector.py`、`replace_inventory()`、`update_container_stats()`。 | 通过 | Docker 不可用时 UI 可以更明确展示错误原因。 |
 | 容器操作 | 支持 start/stop/restart；Server 白名单 + 容器归属校验；Agent 二次校验 action、container_id、allowed label。 | `create_command()`、`DockerCollector.execute()`、label 测试。 | 通过 | 建议 UI 标出“不可操作原因”，例如缺少 label。 |
 | 命令状态机 | 命令流转为 pending/sent/acknowledged/running/success/failed/timeout。 | `db.mark_command_*`、Agent command_ack/running/result、状态机测试。 | 通过 | 可在 UI 命令列表显示更清晰的进度时间线。 |
@@ -46,7 +46,7 @@
 | WebUI 容器列表 | 支持名称/镜像搜索、running/stopped/all 过滤、操作确认 modal。 | `web/app.js`、前端静态测试。 | 通过 | 建议增加按状态/名称排序。 |
 | RBAC 体验 | viewer 隐藏/禁用变更类控件，operator/admin 按 scope 放行。 | `require_permission()`、`web/app.js hasScope()`、RBAC 测试。 | 通过 | 多用户管理 UI 仍缺失，需要编辑 YAML 或 reload。 |
 | 配置热重载 | 管理员可调用 `/api/admin/config/reload`；Linux 支持 SIGHUP；会断开凭据过期 Agent。 | `_reload_runtime_config()`、reload 测试。 | 通过 | Windows 只能 API reload，文档需强调。 |
-| Agent 吊销 | `/api/admin/agents/{node_id}/revoke` 可运行时禁用内存凭据并断开连接。 | `_revoke_agent_runtime()`、revoke 测试。 | 部分通过 | 不写回 YAML，重启后需依赖配置持久化；这是设计选择但需清楚提示。 |
+| Agent 吊销 | `/api/admin/agents/{node_id}/revoke` 将凭据指纹和 token ID 持久写入 SQLite，立即断开连接，并在重启/reload 后继续拒绝旧 token。 | `_revoke_agent_runtime()`、`agent_token_revocations`、重启后拒绝测试。 | 通过 | 轮换时使用新的 token ID，并同步禁用 YAML 中的旧凭据以保持配置清晰。 |
 | Prometheus | `/metrics` 需要 `metrics:read`，导出节点在线、CPU、内存、磁盘、Docker 等 gauge。 | `_prometheus_metrics()`、Prometheus 测试。 | 通过 | 可增加 alert/command 指标。 |
 | SQLite 数据层 | WAL、foreign keys、commands、metrics、rollup、alerts、settings、audit_logs 等表齐全。 | `Database.init()`、WAL 测试。 | 通过 | 大规模部署应迁移到 PostgreSQL 或至少增加 DB health/backup 检测。 |
 | 备份与部署 | 提供 PowerShell/Shell 备份脚本、systemd units、Dockerfile、docker-compose。 | `scripts/`、`deploy/systemd/`、`Dockerfile`、`docker-compose.yml`。 | 通过 | 建议补“恢复演练”步骤和 Windows 服务化方案。 |
@@ -134,8 +134,6 @@ monitor.control-plane.allow=true
 | P0 | README 中文内容在当前终端显示为乱码 | 新用户阅读和启动排错困难 | 重写 README 中文段落或拆出 `docs/quickstart.zh-CN.md`。 |
 | P0 | 缺少真实端到端启动记录 | 无法证明本机当前配置一定能跑通 | 按手动验证清单跑一遍并记录结果。 |
 | P1 | WebUI 缺少浏览器自动化测试 | 图表、modal、告警栏、缩放等交互只能靠静态测试证明 | 增加 Playwright smoke test。 |
-| P1 | Agent token revoke 不持久写回 YAML | 重启 Server 后吊销状态依赖人工同步配置 | 文档强调设计，后续可增加安全的配置管理流程。 |
-| P1 | 告警只有 WebUI 展示 | 离开页面后无法收到通知 | 增加 webhook/邮件/飞书/钉钉通知。 |
 | P1 | Docker 错误原因 UI 展示不足 | Docker 不可用或容器缺 label 时用户需要看日志排查 | 在容器列表或节点详情显示 Docker error / control disabled reason。 |
 | P2 | 缺少多用户管理 UI | RBAC 需要编辑 YAML | 增加用户/角色只读查看和管理员编辑页面。 |
 | P2 | 缺少正式 release 包 | 新机器部署仍需手动 clone + venv | 后续提供版本化 zip、Docker image 或安装脚本。 |
@@ -169,6 +167,5 @@ Go Agent 的潜在收益：
 1. 先按本文手动验证清单跑通本机 Server + Agent + WebUI。
 2. 修复 README 中文乱码或新增中文快速启动文档。
 3. 增加 Playwright smoke test，覆盖登录、Dashboard、图表、容器列表、审计导出。
-4. 补 Docker 错误原因展示和告警通知出口。
+4. 补 Docker 错误原因展示，并对接一个实际 webhook 接收端做通知演练。
 5. 再评估是否启动 Go Agent 原型。
-

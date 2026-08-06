@@ -1,25 +1,47 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 import yaml
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from agent.monitor_agent.client import MonitorAgent
-from agent.monitor_agent.config import AgentConfig, load_agent_config
+import server.monitor_server.app as monitor_server_app
+import agent.monitor_agent.client as monitor_agent_client
+from agent.monitor_agent.client import (
+    AgentAuthenticationError,
+    AgentProtocolError,
+    CollectionInProgressError,
+    CollectionTimeoutError,
+    MonitorAgent,
+)
+from agent.monitor_agent.config import AgentConfig, DockerConfig, ReconnectConfig, load_agent_config
 from agent.monitor_agent.collectors.docker_collector import DockerCollector
-from server.monitor_server.app import _handle_agent_message, create_app
-from server.monitor_server.config import AgentCredential, ApiTokenConfig, ServerConfig, UserConfig, load_server_config
+from server.monitor_server.app import _handle_agent_message, _run_metrics_maintenance, create_app
+from server.monitor_server.config import (
+    AgentCredential,
+    AlertNotificationConfig,
+    AlertWebhookConfig,
+    ApiTokenConfig,
+    ServerConfig,
+    UserConfig,
+    load_server_config,
+)
 from server.monitor_server.db import Database
 from server.monitor_server.doctor import format_doctor_report, run_config_doctor
 from server.monitor_server.hub import ConnectionHub
 from server.monitor_server.init_config import write_init_config_files
+from server.monitor_server.notifications import AlertNotifier
 from server.monitor_server.security import hash_secret, verify_secret
 
 
@@ -37,6 +59,34 @@ class FakeAgentWebSocket:
         self.messages.append(json.loads(raw))
 
 
+class FakeAgentAuthWebSocket(FakeAgentWebSocket):
+    def __init__(self, response: dict[str, object]) -> None:
+        super().__init__()
+        self.response = response
+
+    async def recv(self) -> str:
+        return json.dumps(self.response)
+
+
+class FakeHubWebSocket:
+    def __init__(self, *, hang: bool = False, fail: bool = False) -> None:
+        self.hang = hang
+        self.fail = fail
+        self.messages: list[dict[str, object]] = []
+        self.closed = False
+
+    async def send_json(self, message: dict[str, object]) -> None:
+        if self.hang:
+            await asyncio.Event().wait()
+        if self.fail:
+            raise RuntimeError("websocket is closed")
+        self.messages.append(message)
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        _ = (code, reason)
+        self.closed = True
+
+
 class FakeDocker:
     def __init__(self) -> None:
         self.executed: tuple[str, str] | None = None
@@ -47,6 +97,9 @@ class FakeDocker:
 
     def inventory(self) -> list[dict[str, object]]:
         return []
+
+    def inventory_snapshot(self) -> dict[str, object]:
+        return {"ok": True, "containers": self.inventory(), "error": None}
 
 
 class FakeDockerContainer:
@@ -442,6 +495,26 @@ def test_metric_series_falls_back_to_raw_before_rollup(tmp_path: Path) -> None:
     assert payload["points"][0]["cpu_avg"] == 42.0
 
 
+def test_metric_series_supports_dashboard_time_ranges(tmp_path: Path) -> None:
+    db = Database(tmp_path / "monitor.db")
+    db.init()
+    db.ensure_node("agent-a")
+
+    expected_buckets = {
+        "1h": "raw",
+        "24h": "hour",
+        "7d": "hour",
+        "15d": "hour",
+        "30d": "day",
+        "60d": "day",
+        "90d": "day",
+    }
+    for range_name, bucket in expected_buckets.items():
+        payload = db.list_metric_series("agent-a", range_name)
+        assert payload["range"] == range_name
+        assert payload["bucket"] == bucket
+
+
 def test_metric_rollup_populates_hourly_and_daily_series(tmp_path: Path) -> None:
     db = Database(tmp_path / "monitor.db")
     db.init()
@@ -479,6 +552,97 @@ def test_metric_rollup_populates_hourly_and_daily_series(tmp_path: Path) -> None
     assert hourly["summary"]["cpu"]["avg"] == 30.0
     assert daily["source"] == "rollup"
     assert daily["points"][0]["disk_max"] == 90.0
+
+
+def test_metric_rollup_only_reprocesses_recent_buckets(tmp_path: Path) -> None:
+    db = Database(tmp_path / "monitor.db")
+    db.init()
+    db.ensure_node("agent-a")
+    old = datetime.now(timezone.utc) - timedelta(days=5)
+    recent = datetime.now(timezone.utc).replace(minute=5, second=0, microsecond=0)
+    db.save_metrics("agent-a", {"captured_at": old.isoformat(timespec="seconds"), "cpu_percent": 10})
+    db.save_metrics("agent-a", {"captured_at": recent.isoformat(timespec="seconds"), "cpu_percent": 20})
+
+    first = db.rollup_metrics()
+    db.save_metrics(
+        "agent-a",
+        {"captured_at": (recent + timedelta(minutes=5)).isoformat(timespec="seconds"), "cpu_percent": 40},
+    )
+    second = db.rollup_metrics()
+
+    assert first["hourly_source_rows"] == 2
+    assert first["daily_source_rows"] == 2
+    assert second["hourly_source_rows"] == 2
+    assert second["daily_source_rows"] == 2
+    recent_point = db.list_metric_series("agent-a", "7d")["points"][-1]
+    assert recent_point["sample_count"] == 2
+    assert recent_point["cpu_avg"] == 30.0
+
+
+def test_metrics_maintenance_prunes_in_bounded_batches(tmp_path: Path) -> None:
+    db = Database(tmp_path / "monitor.db")
+    db.init()
+    db.ensure_node("agent-a")
+    old = datetime.now(timezone.utc) - timedelta(days=30)
+    for offset in range(5):
+        db.save_metrics(
+            "agent-a",
+            {"captured_at": (old + timedelta(minutes=offset)).isoformat(timespec="seconds"), "cpu_percent": 10},
+        )
+
+    result = _run_metrics_maintenance(
+        db,
+        include_rollup=False,
+        raw_metrics_days=7,
+        hourly_rollup_days=90,
+        daily_rollup_days=365,
+        batch_size=2,
+    )
+
+    assert result["rollup_ran"] is False
+    assert result["pruned_raw"] == 2
+    assert len(db.list_metrics("agent-a")) == 3
+
+
+def test_status_watcher_recovers_after_cycle_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app = create_app(config(tmp_path))
+    app.state.db.init()
+    attempts = 0
+
+    async def run() -> None:
+        nonlocal attempts
+        recovered = asyncio.Event()
+
+        async def flaky_cycle(_: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary watcher failure")
+            recovered.set()
+
+        monkeypatch.setattr(monitor_server_app, "_status_watcher_cycle", flaky_cycle)
+        task = asyncio.create_task(
+            monitor_server_app._status_watcher(app, interval_seconds=0.01, max_retry_seconds=0.02)
+        )
+        await asyncio.wait_for(recovered.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(run())
+        status = app.state.status_watcher_health
+        assert attempts >= 2
+        assert status["cycles_completed"] >= 1
+        assert status["total_failures"] == 1
+        assert status["consecutive_failures"] == 0
+        assert status["last_error"] is None
+        assert status["last_failure_error"] == "temporary watcher failure"
+        assert any(
+            item["event_type"] == "status_watcher_failed" for item in app.state.db.list_audit_logs(limit=20)
+        )
+    finally:
+        app.state.db.close()
 
 
 def test_config_reload_disables_agent_and_disconnects_websocket(tmp_path: Path) -> None:
@@ -558,10 +722,118 @@ def test_revoke_agent_disables_runtime_credential_and_audits(tmp_path: Path) -> 
         assert response.status_code == 200
         assert response.json()["node_id"] == "agent-a"
         assert response.json()["revoked"] is True
+        assert response.json()["revocations_persisted"] == 1
         assert cfg.agents[0].enabled is False
+        assert app.state.db.health_summary(public=False)["revoked_agent_tokens"] == 1
 
         logs = app.state.db.list_audit_logs(limit=10)
         assert any(item["event_type"] == "agent_token_revoked" for item in logs)
+
+
+def test_revoked_agent_token_stays_rejected_after_restart_and_rotation_is_allowed(tmp_path: Path) -> None:
+    database_path = tmp_path / "monitor.db"
+    original = AgentCredential(
+        node_id="agent-a",
+        name="agent-a",
+        token_hash=hash_secret("agent-token-a"),
+        token_id="token-old",
+    )
+    first_config = config(tmp_path, agents=[original])
+    first_app = create_app(first_config)
+
+    with TestClient(first_app) as client:
+        csrf_token = login(client)
+        response = client.post(
+            "/api/admin/agents/agent-a/revoke",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        assert response.status_code == 200
+        assert response.json()["revocations_persisted"] == 1
+
+    assert b"agent-token-a" not in database_path.read_bytes()
+
+    restarted_config = config(
+        tmp_path,
+        database_path=database_path,
+        agents=[
+            AgentCredential(
+                node_id="agent-a",
+                name="agent-a",
+                token_hash=original.token_hash,
+                token_id="renamed-old-token",
+            )
+        ],
+    )
+    restarted_app = create_app(restarted_config)
+    with TestClient(restarted_app) as client:
+        with client.websocket_connect("/agent/ws") as websocket:
+            websocket.send_json(
+                {
+                    "type": "auth",
+                    "agent_id": "agent-a",
+                    "token": "agent-token-a",
+                    "protocol_version": "1",
+                }
+            )
+            assert websocket.receive_json()["error"] == "revoked_credentials"
+            with pytest.raises(WebSocketDisconnect):
+                websocket.receive_json()
+        assert any(
+            item["event_type"] == "agent_revoked_credential_rejected"
+            for item in restarted_app.state.db.list_audit_logs(limit=20)
+        )
+
+    reused_identity_config = config(
+        tmp_path,
+        database_path=database_path,
+        agents=[
+            AgentCredential(
+                node_id="agent-a",
+                name="agent-a",
+                token_hash=hash_secret("agent-token-new"),
+                token_id="token-old",
+            )
+        ],
+    )
+    reused_identity_app = create_app(reused_identity_config)
+    with TestClient(reused_identity_app) as client:
+        with client.websocket_connect("/agent/ws") as websocket:
+            websocket.send_json(
+                {
+                    "type": "auth",
+                    "agent_id": "agent-a",
+                    "token": "agent-token-new",
+                    "protocol_version": "1",
+                }
+            )
+            assert websocket.receive_json()["error"] == "revoked_credentials"
+
+    rotated_config = config(
+        tmp_path,
+        database_path=database_path,
+        agents=[
+            AgentCredential(
+                node_id="agent-a",
+                name="agent-a",
+                token_hash=hash_secret("agent-token-new"),
+                token_id="token-new",
+            )
+        ],
+    )
+    rotated_app = create_app(rotated_config)
+    with TestClient(rotated_app) as client:
+        with client.websocket_connect("/agent/ws") as websocket:
+            websocket.send_json(
+                {
+                    "type": "auth",
+                    "agent_id": "agent-a",
+                    "token": "agent-token-new",
+                    "protocol_version": "1",
+                }
+            )
+            response = websocket.receive_json()
+            assert response["type"] == "auth_ok"
+            assert response["node_id"] == "agent-a"
 
 
 def test_agent_cannot_mark_other_node_command_result(tmp_path: Path) -> None:
@@ -666,7 +938,12 @@ def test_health_reports_public_and_admin_operational_details(tmp_path: Path) -> 
         assert payload["database"]["journal_mode"] == "wal"
         assert payload["database"]["path"].endswith("monitor.db")
         assert payload["background"]["status_watcher"] is True
+        assert payload["background"]["status_watcher_health"]["total_failures"] == 0
+        assert "next_retry_seconds" in payload["background"]["status_watcher_health"]
+        assert payload["background"]["metrics_maintenance"]["running"] is False
+        assert "last_duration_ms" in payload["background"]["metrics_maintenance"]
         assert payload["config"]["command_timeout_seconds"] == cfg.command.timeout_seconds
+        assert payload["config"]["maintenance_batch_size"] == cfg.retention.maintenance_batch_size
 
 
 def test_config_doctor_reports_ok_for_hardened_config(tmp_path: Path) -> None:
@@ -727,7 +1004,12 @@ def test_init_config_wizard_writes_hardened_server_and_agent_configs(tmp_path: P
     assert agent_cfg.server_url == "ws://127.0.0.1:8000/agent/ws"
     assert agent_cfg.agent_id == "dev-agent"
     assert agent_cfg.token == "agent-token"
+    assert agent_cfg.docker.api_timeout_seconds == 10
+    assert agent_cfg.docker.collection_timeout_seconds == 15
+    assert agent_cfg.docker.collection_workers == 3
     assert agent_cfg.docker.allowed_labels == {"monitor.control-plane.allow": "true"}
+    assert agent_cfg.reconnect == ReconnectConfig(1, 30, 60, 20, 5)
+    assert cfg.command.send_timeout_seconds == 5
 
     with pytest.raises(FileExistsError):
         write_init_config_files(
@@ -750,6 +1032,101 @@ def test_duplicate_agent_registration_rejected() -> None:
     asyncio.run(run())
 
 
+def test_agent_websocket_rejects_unsupported_protocol(tmp_path: Path) -> None:
+    app = create_app(config(tmp_path))
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/agent/ws") as websocket:
+            websocket.send_json(
+                {
+                    "type": "auth",
+                    "agent_id": "agent-a",
+                    "token": "agent-token-a",
+                    "protocol_version": "99",
+                }
+            )
+            response = websocket.receive_json()
+            assert response == {
+                "type": "auth_error",
+                "error": "unsupported_protocol",
+                "protocol_version": "1",
+            }
+            with pytest.raises(WebSocketDisconnect):
+                websocket.receive_json()
+
+        assert any(
+            item["event_type"] == "agent_protocol_rejected"
+            for item in app.state.db.list_audit_logs(limit=20)
+        )
+
+
+def test_agent_command_send_timeout_removes_stale_connection() -> None:
+    async def run() -> None:
+        hub = ConnectionHub(send_timeout_seconds=0.01)
+        websocket = FakeHubWebSocket(hang=True)
+        assert await hub.register_agent("agent-a", websocket) is True
+
+        sent = await hub.send_command(
+            "agent-a",
+            {
+                "id": "cmd-timeout",
+                "action": "container.restart",
+                "payload": {"container_id": "a" * 64},
+            },
+            timeout_seconds=60,
+        )
+
+        assert sent is False
+        assert await hub.is_agent_connected("agent-a") is False
+        assert websocket.closed is True
+
+    asyncio.run(run())
+
+
+def test_ui_broadcast_timeout_does_not_block_healthy_clients() -> None:
+    async def run() -> None:
+        hub = ConnectionHub(send_timeout_seconds=0.01)
+        slow = FakeHubWebSocket(hang=True)
+        healthy = FakeHubWebSocket()
+        await hub.register_ui(slow)
+        await hub.register_ui(healthy)
+
+        await hub.broadcast_ui({"type": "node_updated", "node_id": "agent-a"})
+
+        assert healthy.messages == [{"type": "node_updated", "node_id": "agent-a"}]
+        assert await hub.connected_ui_count() == 1
+        assert slow.closed is True
+
+    asyncio.run(run())
+
+
+def test_offline_command_is_marked_send_failed_and_audited(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    app = create_app(cfg)
+
+    with TestClient(app) as client:
+        csrf_token = login(client)
+        app.state.db.ensure_node("agent-a")
+        app.state.db.replace_inventory("agent-a", [{"id": "a" * 64, "ports": {}}])
+
+        response = client.post(
+            "/api/nodes/agent-a/commands",
+            headers={"X-CSRF-Token": csrf_token},
+            json={
+                "action": "container.restart",
+                "payload": {"container_id": "a" * 64},
+            },
+        )
+
+        assert response.status_code == 200
+        command = response.json()
+        assert command["status"] == "send_failed"
+        assert command["result_message"] == "agent is not connected or command delivery failed"
+        logs = app.state.db.list_audit_logs(limit=20)
+        assert any(item["event_type"] == "command_delivery_failed" for item in logs)
+        assert any(item["result"] == "send_failed" for item in logs)
+
+
 def test_invalid_metrics_payload_is_rejected(tmp_path: Path) -> None:
     cfg = config(tmp_path)
     db = Database(tmp_path / "monitor.db")
@@ -768,6 +1145,234 @@ def test_invalid_metrics_payload_is_rejected(tmp_path: Path) -> None:
     assert db.list_metrics("agent-a") == []
     logs = db.list_audit_logs()
     assert logs[0]["event_type"] == "agent_payload_invalid"
+
+
+def test_failed_docker_inventory_preserves_last_successful_snapshot(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    db = Database(tmp_path / "monitor.db")
+    db.init()
+    db.ensure_node("agent-a")
+    db.replace_inventory(
+        "agent-a",
+        [
+            {
+                "id": "a" * 64,
+                "name": "important-service",
+                "image": "example/service:latest",
+                "status": "running",
+                "ports": {},
+            }
+        ],
+    )
+    app = SimpleNamespace(state=SimpleNamespace(config=cfg, db=db, hub=ConnectionHub()))
+
+    asyncio.run(
+        _handle_agent_message(
+            app,
+            "agent-a",
+            {
+                "type": "docker_inventory",
+                "data": {
+                    "ok": False,
+                    "containers": [],
+                    "error": "docker daemon temporarily unavailable",
+                },
+            },
+        )
+    )
+
+    containers = db.list_containers("agent-a")
+    node = db.list_nodes()[0]
+    assert len(containers) == 1
+    assert containers[0]["name"] == "important-service"
+    assert node["docker_inventory_status"] == "stale"
+    assert node["docker_inventory_error"] == "docker daemon temporarily unavailable"
+    assert node["docker_inventory_last_success_at"] is not None
+    logs = db.list_audit_logs(limit=10)
+    assert any(item["event_type"] == "docker_inventory_collection_failed" for item in logs)
+
+
+def test_successful_empty_docker_inventory_clears_previous_snapshot(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    db = Database(tmp_path / "monitor.db")
+    db.init()
+    db.ensure_node("agent-a")
+    db.replace_inventory("agent-a", [{"id": "a" * 64, "ports": {}}])
+    app = SimpleNamespace(state=SimpleNamespace(config=cfg, db=db, hub=ConnectionHub()))
+
+    asyncio.run(
+        _handle_agent_message(
+            app,
+            "agent-a",
+            {"type": "docker_inventory", "data": {"ok": True, "containers": [], "error": None}},
+        )
+    )
+
+    node = db.list_nodes()[0]
+    assert db.list_containers("agent-a") == []
+    assert node["docker_inventory_status"] == "current"
+    assert node["docker_inventory_error"] is None
+    assert node["docker_inventory_last_success_at"] is not None
+
+
+def test_docker_inventory_snapshot_reports_collection_failure() -> None:
+    collector = object.__new__(DockerCollector)
+    collector.enabled = False
+    collector.allowed_labels = {"monitor.control-plane.allow": "true"}
+    collector.client = None
+    collector.error = "disabled"
+    collector.api_timeout_seconds = 10
+    collector._connect_lock = threading.Lock()
+
+    snapshot = collector.inventory_snapshot()
+
+    assert snapshot == {"ok": False, "containers": [], "error": "disabled"}
+
+
+def test_blocking_collection_does_not_block_event_loop_or_duplicate_after_timeout() -> None:
+    async def run() -> None:
+        agent = MonitorAgent(
+            AgentConfig(
+                docker=DockerConfig(
+                    enabled=False,
+                    collection_timeout_seconds=1,
+                    collection_workers=1,
+                )
+            )
+        )
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_collection() -> str:
+            started.set()
+            release.wait(timeout=2)
+            return "finished"
+
+        try:
+            collection = asyncio.create_task(
+                agent._run_blocking_collection("slow", blocking_collection, timeout_seconds=0.5)
+            )
+            assert await asyncio.to_thread(started.wait, 1) is True
+            await asyncio.sleep(0)
+            assert collection.done() is False
+            with pytest.raises(CollectionTimeoutError):
+                await collection
+            with pytest.raises(CollectionInProgressError):
+                await agent._run_blocking_collection("slow", blocking_collection, timeout_seconds=1)
+
+            release.set()
+            for _ in range(100):
+                if "slow" not in agent._collector_futures:
+                    break
+                await asyncio.sleep(0.01)
+            assert "slow" not in agent._collector_futures
+            assert await agent._run_blocking_collection("slow", lambda: "next", timeout_seconds=1) == "next"
+        finally:
+            release.set()
+            agent.close()
+
+    asyncio.run(run())
+
+
+def test_agent_docker_timeout_config_is_bounded(tmp_path: Path) -> None:
+    config_path = tmp_path / "agent.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "docker:",
+                "  api_timeout_seconds: 12",
+                "  collection_timeout_seconds: 20",
+                "  collection_workers: 4",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_agent_config(str(config_path))
+    assert loaded.docker.api_timeout_seconds == 12
+    assert loaded.docker.collection_timeout_seconds == 20
+    assert loaded.docker.collection_workers == 4
+
+    config_path.write_text("docker:\n  collection_workers: 0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="between 1 and 8"):
+        load_agent_config(str(config_path))
+
+
+def test_agent_reconnect_config_is_bounded(tmp_path: Path) -> None:
+    config_path = tmp_path / "agent.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "reconnect:",
+                "  initial_seconds: 2",
+                "  max_seconds: 45",
+                "  stable_reset_seconds: 90",
+                "  jitter_percent: 25",
+                "  auth_timeout_seconds: 8",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_agent_config(str(config_path))
+    assert loaded.reconnect == ReconnectConfig(2, 45, 90, 25, 8)
+
+    config_path.write_text("reconnect:\n  initial_seconds: 10\n  max_seconds: 5\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="max_seconds"):
+        load_agent_config(str(config_path))
+
+
+def test_agent_waits_for_auth_ok_and_validates_protocol() -> None:
+    async def run() -> None:
+        agent = MonitorAgent(AgentConfig())
+        accepted = FakeAgentAuthWebSocket(
+            {"type": "auth_ok", "node_id": "dev-agent", "protocol_version": "1"}
+        )
+        try:
+            await agent._authenticate(accepted)
+            assert accepted.messages[0]["type"] == "auth"
+            assert accepted.messages[0]["protocol_version"] == "1"
+            assert agent._connected_at is not None
+
+            rejected = FakeAgentAuthWebSocket(
+                {"type": "auth_error", "error": "invalid_credentials", "protocol_version": "1"}
+            )
+            with pytest.raises(AgentAuthenticationError, match="invalid_credentials"):
+                await agent._authenticate(rejected)
+
+            incompatible = FakeAgentAuthWebSocket(
+                {"type": "auth_ok", "node_id": "dev-agent", "protocol_version": "2"}
+            )
+            with pytest.raises(AgentProtocolError, match="expected 1"):
+                await agent._authenticate(incompatible)
+        finally:
+            agent.close()
+
+    asyncio.run(run())
+
+
+def test_agent_reconnect_delay_has_jitter_and_resets_after_stable_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = MonitorAgent(
+        AgentConfig(
+            reconnect=ReconnectConfig(
+                initial_seconds=2,
+                max_seconds=30,
+                stable_reset_seconds=60,
+                jitter_percent=20,
+                auth_timeout_seconds=5,
+            )
+        )
+    )
+    try:
+        monkeypatch.setattr(monitor_agent_client.random, "uniform", lambda _low, high: high)
+        assert agent._jittered_reconnect_delay(10) == 12
+        agent._connected_at = time.monotonic() - 61
+        assert agent._backoff_after_disconnect(30) == 2
+        assert agent._connected_at is None
+    finally:
+        agent.close()
 
 
 def test_stale_commands_timeout(tmp_path: Path) -> None:
@@ -901,8 +1506,13 @@ def test_frontend_supports_collapsible_sidebar_navigation() -> None:
     styles = Path("web/styles.css").read_text(encoding="utf-8")
 
     assert 'id="sidebar-toggle"' in markup
+    assert 'id="mobile-nav-toggle"' in markup
+    assert 'id="sidebar-scrim"' in markup
     assert "monitor.sidebarCollapsed" in script
     assert "toggleSidebar" in script
+    assert "toggleMobileSidebar" in script
+    assert "closeMobileSidebar" in script
+    assert "isCompactNavigation" in script
     assert "applySidebarState" in script
     assert 'stored === "false"' in script
     assert "sidebar-collapsed" in styles
@@ -910,6 +1520,8 @@ def test_frontend_supports_collapsible_sidebar_navigation() -> None:
     assert "translateX(-100%)" in styles
     assert "content: attr(data-label)" in styles
     assert "dataset.label" in script
+    assert ".mobile-nav-toggle" in styles
+    assert ".sidebar-scrim" in styles
 
 
 def test_frontend_navigation_switches_independent_pages() -> None:
@@ -921,6 +1533,7 @@ def test_frontend_navigation_switches_independent_pages() -> None:
     assert 'data-page="containers"' in markup
     assert 'data-page="commands"' in markup
     assert 'data-page="audit"' in markup
+    assert 'data-page="admin"' in markup
     assert "currentPage: loadPage()" in script
     assert "changePage" in script
     assert "applyPage" in script
@@ -928,6 +1541,29 @@ def test_frontend_navigation_switches_independent_pages() -> None:
     assert "monitor.currentPage" in script
     assert ".app-page" in styles
     assert "grid-template-columns: minmax(0, 1fr)" in styles
+
+
+def test_frontend_has_admin_health_page_and_reload_control() -> None:
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    markup = Path("web/index.html").read_text(encoding="utf-8")
+    styles = Path("web/styles.css").read_text(encoding="utf-8")
+
+    assert 'data-page-link="admin"' in markup
+    assert "data-admin-only" in markup
+    assert 'id="admin-reload-config"' in markup
+    assert 'id="admin-db-details"' in markup
+    assert 'id="admin-config-details"' in markup
+    assert 'id="admin-pending-commands"' in markup
+    assert "/api/admin/health" in script
+    assert "/api/admin/config/reload" in script
+    assert "renderAdminHealth" in script
+    assert "status_watcher_health" in script
+    assert "watcherFailures" in script
+    assert "reloadConfig" in script
+    assert "syncAdminVisibility" in script
+    assert "hasScope(\"*\") ? api(\"/api/admin/health\")" in script
+    assert ".admin-grid" in styles
+    assert ".detail-list" in styles
 
 
 def test_frontend_pages_have_operational_insight_cards() -> None:
@@ -976,6 +1612,52 @@ def test_frontend_has_container_search_and_status_filters() -> None:
     assert "containerMatchesFilters" in script
     assert "No containers match the current filters." in script
     assert ".container-controls" in styles
+    assert "setTableCellLabel" in script
+    assert "content: attr(data-label)" in styles
+    assert "table-empty-row" in styles
+
+
+def test_frontend_has_loading_error_and_empty_states() -> None:
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    styles = Path("web/styles.css").read_text(encoding="utf-8")
+
+    assert "hasLoaded: false" in script
+    assert "isLoading: false" in script
+    assert "refreshError" in script
+    assert "createDataEmptyState" in script
+    assert "createEmptyState" in script
+    assert 't("empty.retry")' in script
+    assert ".empty-state" in styles
+    assert ".empty-state.loading" in styles
+    assert ".empty-state.error" in styles
+
+
+def test_frontend_marks_stale_docker_inventory() -> None:
+    script = Path("web/app.js").read_text(encoding="utf-8")
+
+    assert '"docker.inventoryStale"' in script
+    assert 'node.docker_inventory_status === "stale"' in script
+    assert "node.docker_inventory_error" in script
+    assert "dockerStatusText" in script
+
+
+def test_frontend_websocket_reconnect_is_bounded_and_cancelable() -> None:
+    script = Path("web/app.js").read_text(encoding="utf-8")
+
+    assert "wsReconnectTimer: null" in script
+    assert "wsReconnectAttempts: 0" in script
+    assert "function scheduleWsReconnect" in script
+    assert "Math.min(30000" in script
+    assert "Math.random()" in script
+    assert "clearTimeout(state.wsReconnectTimer)" in script
+    assert "if (state.ws !== ws) return" in script
+
+
+def test_frontend_treats_send_failed_as_a_problem_command() -> None:
+    script = Path("web/app.js").read_text(encoding="utf-8")
+
+    assert 'new Set(["failed", "send_failed", "timeout"])' in script
+    assert '=== "send_failed") return "failed"' in script
 
 
 def test_frontend_respects_rbac_scopes_for_mutating_controls() -> None:
@@ -1057,7 +1739,10 @@ def test_ui_smoke_check_script_exercises_real_browser_flow() -> None:
     assert "data-page-link" in script
     assert "language-select" in script
     assert "theme-toggle" in script
+    assert 'clickPage(page, "admin")' in script
     assert "setViewportSize" in script
+    assert '#mobile-nav-toggle' in script
+    assert "#app-view.sidebar-collapsed" in script
 
 
 def test_yaml_artifacts_parse() -> None:
@@ -1104,3 +1789,172 @@ def test_login_rejects_invalid_payload_shape(tmp_path: Path) -> None:
             json={"username": "admin", "password": "x" * 5000},
         )
         assert response.status_code == 400
+
+
+def test_alert_webhook_config_rejects_plaintext_secret_and_insecure_production_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "server.yaml"
+    path.write_text(
+        """
+environment: development
+alert_notifications:
+  enabled: false
+  webhooks:
+    - name: local
+      url: http://127.0.0.1:9000/alerts
+      secret: plaintext-secret
+      secret_env: MONITOR_TEST_ALERT_SECRET
+""".strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Plaintext alert_notifications"):
+        load_server_config(str(path))
+
+    monkeypatch.setenv("MONITOR_TEST_ALERT_SECRET", "s" * 32)
+    path.write_text(
+        """
+environment: production
+alert_notifications:
+  enabled: true
+  webhooks:
+    - name: operations
+      url: http://alerts.example.com/monitor
+      secret_env: MONITOR_TEST_ALERT_SECRET
+""".strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        load_server_config(str(path))
+
+
+def test_alert_webhook_config_resolves_secret_from_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "server.yaml"
+    monkeypatch.setenv("MONITOR_TEST_ALERT_SECRET", "s" * 32)
+    path.write_text(
+        """
+environment: development
+alert_notifications:
+  enabled: true
+  queue_size: 12
+  worker_count: 1
+  webhooks:
+    - name: local
+      url: http://127.0.0.1:9000/alerts
+      secret_env: MONITOR_TEST_ALERT_SECRET
+      enabled: true
+""".strip(),
+        encoding="utf-8",
+    )
+
+    loaded = load_server_config(str(path))
+
+    assert loaded.alert_notifications.enabled is True
+    assert loaded.alert_notifications.queue_size == 12
+    assert loaded.alert_notifications.webhooks[0].secret == "s" * 32
+    assert "s" * 32 not in repr(loaded.alert_notifications.webhooks[0])
+
+
+def test_alert_notifier_signs_retries_and_audits_delivery() -> None:
+    requests: list[httpx.Request] = []
+    audits: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503 if len(requests) == 1 else 204)
+
+    notification_config = AlertNotificationConfig(
+        enabled=True,
+        queue_size=10,
+        worker_count=1,
+        request_timeout_seconds=1,
+        max_attempts=2,
+        retry_base_seconds=0,
+        webhooks=[
+            AlertWebhookConfig(
+                name="operations",
+                url="https://alerts.example.com/monitor",
+                secret_env="MONITOR_TEST_ALERT_SECRET",
+                secret="s" * 32,
+            )
+        ],
+    )
+    notifier = AlertNotifier(
+        notification_config,
+        lambda **event: audits.append(event),
+        transport=httpx.MockTransport(handler),
+    )
+    alert_event = {
+        "type": "alert_created",
+        "alert": {"id": "alert-1", "node_id": "agent-a", "metric": "cpu", "value": 95},
+    }
+
+    async def exercise() -> dict[str, object]:
+        await notifier.start()
+        assert notifier.enqueue(alert_event) == 1
+        await asyncio.wait_for(notifier.join(), timeout=1)
+        status = notifier.status()
+        await notifier.stop()
+        return status
+
+    status = asyncio.run(exercise())
+
+    assert len(requests) == 2
+    body = requests[-1].content
+    timestamp = requests[-1].headers["X-Monitor-Timestamp"]
+    expected = hmac.new(
+        b"s" * 32,
+        timestamp.encode("ascii") + b"." + body,
+        hashlib.sha256,
+    ).hexdigest()
+    assert requests[-1].headers["X-Monitor-Signature"] == f"sha256={expected}"
+    assert json.loads(body)["alert"]["id"] == "alert-1"
+    assert status["delivered"] == 1
+    assert status["failed"] == 0
+    assert any(event["event_type"] == "alert_notification_delivered" for event in audits)
+
+
+def test_alert_notifier_does_not_follow_redirects_or_retry_client_errors() -> None:
+    requests: list[httpx.Request] = []
+    audits: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(302, headers={"Location": "http://127.0.0.1/internal"})
+
+    notification_config = AlertNotificationConfig(
+        enabled=True,
+        worker_count=1,
+        max_attempts=3,
+        retry_base_seconds=0,
+        webhooks=[
+            AlertWebhookConfig(
+                name="operations",
+                url="https://alerts.example.com/monitor",
+                secret_env="MONITOR_TEST_ALERT_SECRET",
+                secret="s" * 32,
+            )
+        ],
+    )
+    notifier = AlertNotifier(
+        notification_config,
+        lambda **event: audits.append(event),
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def exercise() -> None:
+        await notifier.start()
+        notifier.enqueue({"type": "alert_resolved", "alert": {"id": "alert-1"}})
+        await asyncio.wait_for(notifier.join(), timeout=1)
+        await notifier.stop()
+
+    asyncio.run(exercise())
+
+    assert len(requests) == 1
+    failure = next(event for event in audits if event["event_type"] == "alert_notification_failed")
+    assert failure["detail"]["status_code"] == 302
+    assert failure["detail"]["attempts"] == 1

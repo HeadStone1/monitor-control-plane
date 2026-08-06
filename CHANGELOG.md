@@ -6,12 +6,29 @@
 
 - Added `--init-config` to generate local `server.yaml` and `agent.yaml` with Argon2id hashes, a random session secret, an initial Agent token, RBAC defaults, retention settings, and Docker allowed-label defaults.
 - Added `scripts/ui_smoke_check.ps1` and `scripts/ui_smoke_check.mjs` for optional real-browser WebUI validation with Playwright.
+- Added an admin-only `Admin / Health` WebUI page for database status, background task status, runtime config details, capacity counters, and config reload.
 - Added tests for the config initialization flow and UI smoke-check script coverage.
+- Added signed external alert webhooks with environment-only secrets, a bounded worker queue, delivery retries, failure auditing, and Admin health telemetry.
 
 ### Changed
 
+- Refined the overview icons and metric chart, added per-series visibility controls, and expanded selectable ranges to `1h / 24h / 7d / 15d / 30d / 60d / 90d`.
+- Refined dashboard spacing, responsive header grouping, compact overview cards, drawer behavior, and mobile chart sizing.
+- Added a dedicated mobile navigation drawer, responsive container cards, and distinct loading, failure, and empty states.
 - Updated README quick start to recommend the config initialization wizard before manual hash generation.
+- Updated WebUI smoke check coverage to include the admin health page.
 - Documented the optional browser smoke check command and the files that should be included in this update.
+
+### Fixed
+
+- Preserve the last successful Docker container inventory when collection fails, and expose stale/error timestamps instead of treating a transient Docker error as an empty host.
+- Run blocking system and Docker collectors in a bounded worker pool with Docker API and collection timeouts, keeping heartbeats and WebSocket command handling responsive.
+- Add bounded, serialized WebSocket sends with concurrent UI fan-out, stale-client cleanup, and a terminal `send_failed` command state when Agent delivery fails.
+- Replace full-table Python metric rollups with incremental SQLite aggregation, move maintenance work off the async event loop, prune data in bounded batches, and expose maintenance health telemetry.
+- Keep the background status watcher alive after transient cycle failures with bounded retry backoff, audited failures, degraded health reporting, and Admin-page recovery telemetry.
+- Require an Agent `auth_ok` protocol handshake before telemetry starts, add configurable jittered reconnect backoff with stable-connection reset, clean up connection tasks deterministically, and prevent duplicate WebUI reconnect timers.
+- Persist Agent credential revocations in SQLite using token IDs and non-secret fingerprints, enforce them after restart and config reload, and preserve rotation through a new token identity.
+- Keep alert delivery outside the Agent metrics path, require HTTPS in production, disable redirects and environment proxies, and avoid reading response bodies.
 
 ## 2026-05-18
 

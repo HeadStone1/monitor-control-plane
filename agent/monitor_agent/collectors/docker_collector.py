@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from typing import Any
 
 try:
@@ -13,65 +14,91 @@ except ImportError:  # pragma: no cover
 
 
 class DockerCollector:
-    def __init__(self, enabled: bool = True, allowed_labels: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        enabled: bool = True,
+        allowed_labels: dict[str, str] | None = None,
+        api_timeout_seconds: int = 10,
+    ) -> None:
         self.enabled = enabled
         self.allowed_labels = allowed_labels or {"monitor.control-plane.allow": "true"}
+        self.api_timeout_seconds = api_timeout_seconds
         self.client: Any | None = None
         self.error: str | None = None
-        self._connect()
+        self._connect_lock = threading.Lock()
 
     def _connect(self) -> None:
-        if not self.enabled:
-            self.error = "disabled"
-            return
-        if docker is None:
-            self.error = "docker python package is not installed"
-            return
-        try:
-            self.client = docker.from_env()
-            self.client.ping()
-            self.error = None
-        except DockerException as exc:
-            self.client = None
-            self.error = str(exc)
+        with self._connect_lock:
+            if self.client:
+                return
+            if not self.enabled:
+                self.error = "disabled"
+                return
+            if docker is None:
+                self.error = "docker python package is not installed"
+                return
+            try:
+                self.client = docker.from_env(timeout=self.api_timeout_seconds)
+                self.client.ping()
+                self.error = None
+            except DockerException as exc:
+                self.client = None
+                self.error = str(exc)
+
+    def _client_or_connect(self) -> Any | None:
+        client = self.client
+        if client is None:
+            self._connect()
+            client = self.client
+        return client
+
+    def _invalidate_client(self, client: Any, error: Exception) -> None:
+        with self._connect_lock:
+            if self.client is client:
+                self.client = None
+            self.error = str(error)
 
     def info(self) -> dict[str, Any]:
-        if not self.client:
-            self._connect()
-        if not self.client:
+        client = self._client_or_connect()
+        if client is None:
             return {
                 "available": False,
                 "version": None,
                 "error": self.error,
             }
         try:
-            version = self.client.version().get("Version")
+            version = client.version().get("Version")
             return {
                 "available": True,
                 "version": version,
                 "error": None,
             }
         except DockerException as exc:
-            self.client = None
-            self.error = str(exc)
+            self._invalidate_client(client, exc)
             return {
                 "available": False,
                 "version": None,
                 "error": self.error,
             }
 
-    def inventory(self) -> list[dict[str, Any]]:
-        if not self.client:
-            self._connect()
-        if not self.client:
-            return []
+    def inventory_snapshot(self) -> dict[str, Any]:
+        client = self._client_or_connect()
+        if client is None:
+            return {
+                "ok": False,
+                "containers": [],
+                "error": self.error or "docker is not available",
+            }
 
         try:
-            containers = self.client.containers.list(all=True)
+            containers = client.containers.list(all=True)
         except DockerException as exc:
-            self.client = None
-            self.error = str(exc)
-            return []
+            self._invalidate_client(client, exc)
+            return {
+                "ok": False,
+                "containers": [],
+                "error": self.error,
+            }
 
         items: list[dict[str, Any]] = []
         for container in containers:
@@ -92,19 +119,26 @@ class DockerCollector:
                     "ports": network.get("Ports") or {},
                 }
             )
-        return items
+        self.error = None
+        return {
+            "ok": True,
+            "containers": items,
+            "error": None,
+        }
+
+    def inventory(self) -> list[dict[str, Any]]:
+        """Return containers for callers that do not need collection health."""
+        return self.inventory_snapshot()["containers"]
 
     def stats(self) -> list[dict[str, Any]]:
-        if not self.client:
-            self._connect()
-        if not self.client:
+        client = self._client_or_connect()
+        if client is None:
             return []
 
         try:
-            containers = self.client.containers.list(all=False)
+            containers = client.containers.list(all=False)
         except DockerException as exc:
-            self.client = None
-            self.error = str(exc)
+            self._invalidate_client(client, exc)
             return []
 
         items: list[dict[str, Any]] = []
@@ -129,13 +163,12 @@ class DockerCollector:
         if not re.fullmatch(r"[a-fA-F0-9]{12,128}", container_id):
             return False, "invalid container id"
 
-        if not self.client:
-            self._connect()
-        if not self.client:
+        client = self._client_or_connect()
+        if client is None:
             return False, self.error or "docker is not available"
 
         try:
-            container = self.client.containers.get(container_id)
+            container = client.containers.get(container_id)
             if not self._is_control_allowed(container):
                 return False, "container is not labeled for monitor control-plane actions"
             if action == "container.start":

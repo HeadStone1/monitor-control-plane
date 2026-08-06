@@ -1,15 +1,71 @@
+# Local environments and Python caches
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.tox/
+.nox/
+
+# Coverage, packaging, and build output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Runtime data and backups
 data/
+backups/
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
-.env
-server.yaml
-agent.yaml
+*.log
 
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+server.yaml
+server.local.yaml
+server.production.yaml
+agent.yaml
+agent.local.yaml
+agent.production.yaml
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+credentials.json
+secrets.yaml
+secrets.yml
+
+# JavaScript and browser-test output
+node_modules/
+playwright-report/
+test-results/
+
+# Editors, operating systems, and local AI tooling
+.idea/
+.vscode/
+.agents/
+.codex/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+CLAUDE.md
+
+# Keep unpublished security findings local until remediation is released
+security-scans/monitor-control-plane_2026-08-06/

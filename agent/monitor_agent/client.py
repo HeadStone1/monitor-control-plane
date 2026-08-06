@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
+import random
 import ssl
 import time
 from typing import Any
@@ -19,6 +21,23 @@ from .config import AgentConfig
 from .timeutil import utc_now
 
 LOGGER = logging.getLogger("monitor.agent")
+AGENT_PROTOCOL_VERSION = "1"
+
+
+class CollectionInProgressError(RuntimeError):
+    pass
+
+
+class CollectionTimeoutError(TimeoutError):
+    pass
+
+
+class AgentAuthenticationError(RuntimeError):
+    pass
+
+
+class AgentProtocolError(RuntimeError):
+    pass
 
 
 class MonitorAgent:
@@ -28,25 +47,43 @@ class MonitorAgent:
         self.docker = DockerCollector(
             enabled=config.docker.enabled,
             allowed_labels=config.docker.allowed_labels,
+            api_timeout_seconds=config.docker.api_timeout_seconds,
         )
         self.seq = 0
         self._send_lock = asyncio.Lock()
+        self._collector_executor = ThreadPoolExecutor(
+            max_workers=config.docker.collection_workers,
+            thread_name_prefix="monitor-collector",
+        )
+        self._collector_futures: dict[str, asyncio.Future[Any]] = {}
+        self._connected_at: float | None = None
 
     async def run_forever(self) -> None:
-        backoff = 1
-        while True:
-            try:
-                await self._run_once()
-                backoff = 1
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                LOGGER.warning("agent disconnected: %s", exc)
-                LOGGER.info("reconnecting in %s seconds", backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(30, backoff * 2)
+        backoff = self.config.reconnect.initial_seconds
+        try:
+            while True:
+                try:
+                    await self._run_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    backoff = self._backoff_after_disconnect(backoff)
+                    delay = self._jittered_reconnect_delay(backoff)
+                    LOGGER.warning("agent disconnected: %s", exc)
+                    LOGGER.info("reconnecting in %.2f seconds", delay)
+                    await asyncio.sleep(delay)
+                    backoff = min(
+                        self.config.reconnect.max_seconds,
+                        max(self.config.reconnect.initial_seconds, backoff * 2),
+                    )
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        self._collector_executor.shutdown(wait=False, cancel_futures=True)
 
     async def _run_once(self) -> None:
+        self._connected_at = None
         url = self._build_url()
         ssl_context = self._ssl_context(url)
         LOGGER.info("connecting to %s", urlsplit(url)._replace(query="...").geturl())
@@ -58,9 +95,11 @@ class MonitorAgent:
             ping_timeout=20,
             max_size=2_000_000,
         ) as websocket:
-            LOGGER.info("connected")
-            await self._send_auth(websocket)
-            await self._send(websocket, "hello", self._host_info())
+            LOGGER.info("transport connected; authenticating")
+            await self._authenticate(websocket)
+            LOGGER.info("authenticated")
+            host_info = await self._collect_host_info()
+            await self._send(websocket, "hello", host_info)
 
             tasks = [
                 asyncio.create_task(self._heartbeat_loop(websocket)),
@@ -70,11 +109,52 @@ class MonitorAgent:
                 asyncio.create_task(self._host_info_loop(websocket)),
                 asyncio.create_task(self._receive_loop(websocket)),
             ]
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-            for task in pending:
-                task.cancel()
-            for task in done:
-                task.result()
+            try:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+                raise ConnectionError("agent WebSocket closed")
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _authenticate(self, websocket: Any) -> None:
+        await self._send_auth(websocket)
+        try:
+            raw = await asyncio.wait_for(
+                websocket.recv(),
+                timeout=self.config.reconnect.auth_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise AgentAuthenticationError("server authentication response timed out") from exc
+
+        try:
+            response = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise AgentAuthenticationError("server returned an invalid authentication response") from exc
+        if not isinstance(response, dict) or response.get("type") != "auth_ok":
+            reason = str(response.get("error") or "authentication rejected") if isinstance(response, dict) else "authentication rejected"
+            raise AgentAuthenticationError(reason)
+        protocol_version = str(response.get("protocol_version") or "")
+        if protocol_version != AGENT_PROTOCOL_VERSION:
+            raise AgentProtocolError(
+                f"unsupported server protocol version {protocol_version or 'missing'}; expected {AGENT_PROTOCOL_VERSION}"
+            )
+        self._connected_at = time.monotonic()
+
+    def _backoff_after_disconnect(self, current_backoff: int) -> int:
+        connected_at = self._connected_at
+        self._connected_at = None
+        if connected_at is not None and time.monotonic() - connected_at >= self.config.reconnect.stable_reset_seconds:
+            return self.config.reconnect.initial_seconds
+        return current_backoff
+
+    def _jittered_reconnect_delay(self, backoff: int) -> float:
+        bounded = min(self.config.reconnect.max_seconds, max(self.config.reconnect.initial_seconds, backoff))
+        jitter = bounded * (self.config.reconnect.jitter_percent / 100)
+        return max(0.0, bounded + random.uniform(-jitter, jitter))
 
     def _build_url(self) -> str:
         return self.config.server_url
@@ -101,7 +181,7 @@ class MonitorAgent:
             "agent_name": self.config.agent_name,
             "token": self.config.token,
             "agent_version": "0.1.0",
-            "protocol_version": "1",
+            "protocol_version": AGENT_PROTOCOL_VERSION,
         }
         await websocket.send(json.dumps(message, ensure_ascii=True))
 
@@ -125,23 +205,88 @@ class MonitorAgent:
 
     async def _metrics_loop(self, websocket: Any) -> None:
         while True:
-            await self._send(websocket, "metrics", self.system.collect())
+            metrics = await self._collect_optional("metrics", self.system.collect)
+            if metrics is not None:
+                await self._send(websocket, "metrics", metrics)
             await asyncio.sleep(self.config.intervals.metrics)
 
     async def _docker_inventory_loop(self, websocket: Any) -> None:
         while True:
-            await self._send(websocket, "docker_inventory", {"containers": self.docker.inventory()})
+            inventory = await self._collect_optional("docker_inventory", self.docker.inventory_snapshot)
+            if inventory is None:
+                inventory = {
+                    "ok": False,
+                    "containers": [],
+                    "error": "docker inventory collection timed out or is still running",
+                }
+            await self._send(websocket, "docker_inventory", inventory)
             await asyncio.sleep(self.config.intervals.docker_inventory)
 
     async def _docker_stats_loop(self, websocket: Any) -> None:
         while True:
-            await self._send(websocket, "docker_stats", {"containers": self.docker.stats()})
+            stats = await self._collect_optional("docker_stats", self.docker.stats)
+            if stats is not None:
+                await self._send(websocket, "docker_stats", {"containers": stats})
             await asyncio.sleep(self.config.intervals.docker_stats)
 
     async def _host_info_loop(self, websocket: Any) -> None:
         while True:
             await asyncio.sleep(self.config.intervals.host_info)
-            await self._send(websocket, "host_info", self._host_info())
+            host_info = await self._collect_optional("host_info", self._host_info)
+            if host_info is not None:
+                await self._send(websocket, "host_info", host_info)
+
+    async def _collect_host_info(self) -> dict[str, Any]:
+        host_info = await self._collect_optional("host_info", self._host_info)
+        if host_info is not None:
+            return host_info
+        return {
+            "agent_name": self.config.agent_name,
+            "agent_version": "0.1.0",
+            "docker": {
+                "available": False,
+                "version": None,
+                "error": "host information collection timed out",
+            },
+        }
+
+    async def _collect_optional(self, key: str, callback: Any) -> Any | None:
+        try:
+            return await self._run_blocking_collection(
+                key,
+                callback,
+                self.config.docker.collection_timeout_seconds,
+            )
+        except (CollectionInProgressError, CollectionTimeoutError) as exc:
+            LOGGER.warning("%s", exc)
+        except Exception as exc:
+            LOGGER.warning("%s collection failed: %s", key, exc)
+        return None
+
+    async def _run_blocking_collection(self, key: str, callback: Any, timeout_seconds: int) -> Any:
+        existing = self._collector_futures.get(key)
+        if existing is not None and not existing.done():
+            raise CollectionInProgressError(f"{key} collection is still running")
+        if existing is not None:
+            self._collector_futures.pop(key, None)
+
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(self._collector_executor, callback)
+        self._collector_futures[key] = future
+        future.add_done_callback(lambda finished, name=key: self._collection_finished(name, finished))
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise CollectionTimeoutError(
+                f"{key} collection exceeded {timeout_seconds} seconds"
+            ) from exc
+
+    def _collection_finished(self, key: str, future: asyncio.Future[Any]) -> None:
+        if self._collector_futures.get(key) is future:
+            self._collector_futures.pop(key, None)
+        if future.cancelled():
+            return
+        future.exception()
 
     async def _receive_loop(self, websocket: Any) -> None:
         async for raw in websocket:
@@ -202,7 +347,14 @@ class MonitorAgent:
                 "message": result,
             },
         )
-        await self._send(websocket, "docker_inventory", {"containers": self.docker.inventory()})
+        inventory = await self._collect_optional("docker_inventory", self.docker.inventory_snapshot)
+        if inventory is None:
+            inventory = {
+                "ok": False,
+                "containers": [],
+                "error": "docker inventory collection timed out or is still running",
+            }
+        await self._send(websocket, "docker_inventory", inventory)
 
 
 def _is_loopback_host(host: str) -> bool:

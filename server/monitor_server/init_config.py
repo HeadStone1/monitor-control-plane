@@ -97,12 +97,22 @@ def build_init_config_payloads(
             "max_string_length": 256,
             "max_ports_entries": 64,
         },
-        "command": {"timeout_seconds": 60},
+        "command": {"timeout_seconds": 60, "send_timeout_seconds": 5},
         "retention": {
             "raw_metrics_days": 7,
             "hourly_rollup_days": 90,
             "daily_rollup_days": 365,
             "rollup_interval_seconds": 3600,
+            "maintenance_batch_size": 5000,
+        },
+        "alert_notifications": {
+            "enabled": False,
+            "queue_size": 100,
+            "worker_count": 2,
+            "request_timeout_seconds": 5,
+            "max_attempts": 3,
+            "retry_base_seconds": 2,
+            "webhooks": [],
         },
         "heartbeat": {
             "warning_after_seconds": 30,
@@ -124,8 +134,18 @@ def build_init_config_payloads(
             "docker_inventory": 30,
             "host_info": 60,
         },
+        "reconnect": {
+            "initial_seconds": 1,
+            "max_seconds": 30,
+            "stable_reset_seconds": 60,
+            "jitter_percent": 20,
+            "auth_timeout_seconds": 5,
+        },
         "docker": {
             "enabled": True,
+            "api_timeout_seconds": 10,
+            "collection_timeout_seconds": 15,
+            "collection_workers": 3,
             "allowed_labels": {
                 "monitor.control-plane.allow": "true",
             },

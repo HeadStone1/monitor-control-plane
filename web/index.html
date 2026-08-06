@@ -32,7 +32,7 @@
     </section>
 
     <section id="app-view" class="app-shell is-hidden">
-      <aside class="sidebar">
+      <aside id="sidebar-navigation" class="sidebar">
         <div class="sidebar-brand">
           <div class="brand-mark">M</div>
           <div class="brand-copy">
@@ -49,6 +49,7 @@
           <a href="#containers" data-page-link="containers" title="Containers" data-i18n="nav.containers">Containers</a>
           <a href="#commands" data-page-link="commands" title="Commands" data-i18n="nav.commands">Commands</a>
           <a href="#audit" data-page-link="audit" title="Audit" data-i18n="nav.audit">Audit</a>
+          <a href="#admin" data-page-link="admin" data-admin-only title="Admin" data-i18n="nav.admin">Admin</a>
         </nav>
 
         <div class="sidebar-footer">
@@ -59,48 +60,77 @@
           <button id="logout" type="button" data-i18n="auth.signOut">Sign out</button>
         </div>
       </aside>
+      <button id="sidebar-scrim" class="sidebar-scrim is-hidden" type="button" aria-label="Close navigation"></button>
 
       <main class="main-stage">
         <header class="page-header">
-          <div>
-            <span class="eyebrow" data-i18n="header.eyebrow">Distributed Monitoring</span>
-            <h1 data-i18n="header.title">Server Dashboard</h1>
+          <div class="header-leading">
+            <button
+              id="mobile-nav-toggle"
+              class="mobile-nav-toggle"
+              type="button"
+              aria-controls="sidebar-navigation"
+              aria-expanded="false"
+              aria-label="Open navigation"
+            >
+              <span class="menu-icon" aria-hidden="true"><span></span></span>
+            </button>
+            <div>
+              <span class="eyebrow" data-i18n="header.eyebrow">Distributed Monitoring</span>
+              <h1 data-i18n="header.title">Server Dashboard</h1>
+            </div>
           </div>
           <div class="header-actions">
-            <div class="alert-menu">
-              <button id="alerts-toggle" class="alert-button" type="button">
-                <span class="alert-label" data-i18n="alerts.title">Alerts</span>
-                <span id="alert-count" class="alert-count">0</span>
-              </button>
-              <div id="alert-panel" class="alert-panel is-hidden"></div>
+            <div class="header-status">
+              <div class="alert-menu">
+                <button id="alerts-toggle" class="alert-button" type="button">
+                  <span class="alert-label" data-i18n="alerts.title">Alerts</span>
+                  <span id="alert-count" class="alert-count">0</span>
+                </button>
+                <div id="alert-panel" class="alert-panel is-hidden"></div>
+              </div>
+              <span id="current-user" class="user-pill"></span>
             </div>
-            <span id="current-user" class="user-pill"></span>
-            <select id="language-select" class="language-select" aria-label="Language">
-              <option value="en">EN</option>
-              <option value="zh">中文</option>
-            </select>
-            <button id="theme-toggle" type="button" class="theme-toggle">Dark</button>
-            <button id="refresh" type="button" data-i18n="actions.refresh">Refresh</button>
+            <div class="header-tools">
+              <select id="language-select" class="language-select" aria-label="Language">
+                <option value="en">EN</option>
+                <option value="zh">中文</option>
+              </select>
+              <button id="theme-toggle" type="button" class="theme-toggle">Dark</button>
+              <button id="refresh" type="button" data-i18n="actions.refresh">Refresh</button>
+            </div>
           </div>
         </header>
 
         <section id="overview" class="app-page overview-grid" data-page="overview">
           <article class="stat-card blue">
+            <span class="stat-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6 6h.01M6 18h.01"/></svg>
+            </span>
             <span data-i18n="stats.totalNodes">Total Nodes</span>
             <strong id="node-count">0</strong>
             <em data-i18n="stats.registeredAgents">registered agents</em>
           </article>
           <article class="stat-card green">
+            <span class="stat-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg>
+            </span>
             <span data-i18n="stats.online">Online</span>
             <strong id="online-count">0</strong>
             <em data-i18n="stats.healthyConnections">healthy connections</em>
           </article>
           <article class="stat-card yellow">
+            <span class="stat-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="m21 8-9 5-9-5 9-5 9 5Z"/><path d="m3 8 9 5 9-5v8l-9 5-9-5Z"/><path d="M12 13v8"/></svg>
+            </span>
             <span data-i18n="stats.containers">Containers</span>
             <strong id="container-count">0</strong>
             <em data-i18n="stats.visibleContainers">visible containers</em>
           </article>
           <article class="stat-card red">
+            <span class="stat-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>
+            </span>
             <span data-i18n="stats.commands">Commands</span>
             <strong id="command-count">0</strong>
             <em data-i18n="stats.recentOperations">recent operations</em>
@@ -127,36 +157,72 @@
               </div>
               <span id="selected-node-status" class="status-chip neutral">unknown</span>
             </div>
-            <div class="metric-toolbar">
-              <div id="metric-range" class="segmented-control" aria-label="metric range">
-                <button type="button" data-range="1h" class="active">1h</button>
-                <button type="button" data-range="7d">7d</button>
-                <button type="button" data-range="30d">30d</button>
+            <div class="chart-toolbar">
+              <div class="chart-control-group metric-control-group">
+                <span class="chart-control-label" data-i18n="chart.metrics">Metrics</span>
+                <div id="metric-series" class="metric-series-selector" role="group" aria-label="visible metrics">
+                  <button type="button" data-metric="cpu" aria-pressed="true">
+                    <span class="metric-swatch cpu" aria-hidden="true"></span>
+                    <span data-i18n="metrics.cpu">CPU</span>
+                  </button>
+                  <button type="button" data-metric="memory" aria-pressed="true">
+                    <span class="metric-swatch memory" aria-hidden="true"></span>
+                    <span data-i18n="metrics.memory">Memory</span>
+                  </button>
+                  <button type="button" data-metric="disk" aria-pressed="true">
+                    <span class="metric-swatch disk" aria-hidden="true"></span>
+                    <span data-i18n="metrics.disk">Disk</span>
+                  </button>
+                </div>
               </div>
-              <button id="chart-zoom-reset" type="button" class="chart-zoom-reset is-hidden" data-i18n="chart.resetZoom">Reset zoom</button>
-              <div class="threshold-controls" aria-label="metric thresholds">
-                <label>
-                  <span data-i18n="metrics.cpu">CPU</span>
-                  <input id="threshold-cpu" type="number" min="0" max="100" step="1" value="60" />
+              <div class="chart-toolbar-actions">
+                <label class="range-select">
+                  <span data-i18n="chart.range">Time range</span>
+                  <select id="metric-range" aria-label="metric range">
+                    <option value="1h" data-i18n="range.1h">Last hour</option>
+                    <option value="24h" data-i18n="range.24h">Last 24 hours</option>
+                    <option value="7d" data-i18n="range.7d">Last 7 days</option>
+                    <option value="15d" data-i18n="range.15d">Last 15 days</option>
+                    <option value="30d" data-i18n="range.30d">Last 30 days</option>
+                    <option value="60d" data-i18n="range.60d">Last 60 days</option>
+                    <option value="90d" data-i18n="range.90d">Last 90 days</option>
+                  </select>
                 </label>
-                <label>
-                  <span data-i18n="metrics.memory">Memory</span>
-                  <input id="threshold-memory" type="number" min="0" max="100" step="1" value="80" />
-                </label>
-                <label>
-                  <span data-i18n="metrics.disk">Disk</span>
-                  <input id="threshold-disk" type="number" min="0" max="100" step="1" value="85" />
-                </label>
+                <button id="chart-zoom-reset" type="button" class="chart-icon-button is-hidden" data-i18n-title="chart.resetZoom" title="Reset zoom">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+                  <span data-i18n="chart.resetZoom">Reset zoom</span>
+                </button>
+                <details class="threshold-settings">
+                  <summary>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
+                    <span data-i18n="chart.thresholds">Thresholds</span>
+                  </summary>
+                  <div class="threshold-controls" aria-label="metric thresholds">
+                    <label>
+                      <span data-i18n="metrics.cpu">CPU</span>
+                      <input id="threshold-cpu" type="number" min="0" max="100" step="1" value="60" />
+                    </label>
+                    <label>
+                      <span data-i18n="metrics.memory">Memory</span>
+                      <input id="threshold-memory" type="number" min="0" max="100" step="1" value="80" />
+                    </label>
+                    <label>
+                      <span data-i18n="metrics.disk">Disk</span>
+                      <input id="threshold-disk" type="number" min="0" max="100" step="1" value="85" />
+                    </label>
+                  </div>
+                </details>
               </div>
             </div>
             <div class="mini-metrics">
-              <div><span>CPU</span><strong id="mini-cpu">-</strong></div>
-              <div><span>Memory</span><strong id="mini-memory">-</strong></div>
-              <div><span>Disk</span><strong id="mini-disk">-</strong></div>
+              <div><span data-i18n="metrics.cpu">CPU</span><strong id="mini-cpu">-</strong></div>
+              <div><span data-i18n="metrics.memory">Memory</span><strong id="mini-memory">-</strong></div>
+              <div><span data-i18n="metrics.disk">Disk</span><strong id="mini-disk">-</strong></div>
               <div><span>Docker</span><strong id="mini-docker">-</strong></div>
             </div>
             <div id="metric-summary" class="metric-summary"></div>
             <div class="chart-frame">
+              <div id="chart-context" class="chart-context" aria-live="polite"></div>
               <canvas id="metric-chart" width="960" height="340"></canvas>
               <div id="chart-tooltip" class="chart-tooltip is-hidden" role="status"></div>
             </div>
@@ -287,6 +353,58 @@
               <button id="audit-export" type="button" data-i18n="audit.exportCsv">Export CSV</button>
             </div>
             <div id="audit-list" class="event-list"></div>
+          </section>
+        </section>
+
+        <section id="admin" class="app-page admin-page is-hidden" data-page="admin">
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <h2 data-i18n="panels.adminHealth">Admin / Health</h2>
+                <p data-i18n="admin.subtitle">Operational health and runtime controls</p>
+              </div>
+              <button id="admin-reload-config" type="button" data-i18n="admin.reloadConfig">Reload config</button>
+            </div>
+            <div class="page-insights">
+              <article class="insight-card green">
+                <span data-i18n="admin.status">Status</span>
+                <strong id="admin-health-status">-</strong>
+                <em id="admin-health-version">-</em>
+              </article>
+              <article class="insight-card">
+                <span data-i18n="admin.database">Database</span>
+                <strong id="admin-db-mode">-</strong>
+                <em id="admin-db-path">-</em>
+              </article>
+              <article class="insight-card yellow">
+                <span data-i18n="admin.background">Background</span>
+                <strong id="admin-watcher-status">-</strong>
+                <em data-i18n="admin.statusWatcher">status watcher</em>
+              </article>
+              <article class="insight-card red">
+                <span data-i18n="admin.activeAlerts">Active Alerts</span>
+                <strong id="admin-active-alerts">0</strong>
+                <em id="admin-pending-commands">0 pending commands</em>
+              </article>
+            </div>
+            <div class="admin-grid">
+              <section class="admin-card">
+                <h3 data-i18n="admin.databaseDetails">Database Details</h3>
+                <dl id="admin-db-details" class="detail-list"></dl>
+              </section>
+              <section class="admin-card">
+                <h3 data-i18n="admin.runtimeConfig">Runtime Config</h3>
+                <dl id="admin-config-details" class="detail-list"></dl>
+              </section>
+              <section class="admin-card">
+                <h3 data-i18n="admin.capacity">Capacity</h3>
+                <dl id="admin-capacity-details" class="detail-list"></dl>
+              </section>
+              <section class="admin-card">
+                <h3 data-i18n="admin.controls">Controls</h3>
+                <div id="admin-control-details" class="admin-control-details"></div>
+              </section>
+            </div>
           </section>
         </section>
       </main>

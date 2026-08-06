@@ -17,9 +17,17 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .config import AgentCredential, DEV_ADMIN_PASSWORD_HASH, DEV_AGENT_TOKEN_HASH, ServerConfig, load_server_config
-from .db import Database
+from .config import (
+    AgentCredential,
+    DEV_ADMIN_PASSWORD_HASH,
+    DEV_AGENT_TOKEN_HASH,
+    ServerConfig,
+    load_server_config,
+    validate_alert_notification_config,
+)
+from .db import Database, SUPPORTED_METRIC_RANGES
 from .hub import ConnectionHub
+from .notifications import AlertNotifier
 from .security import (
     AuthContext,
     SESSION_COOKIE_NAME,
@@ -40,6 +48,7 @@ ALLOWED_COMMANDS = {
     "container.stop",
     "container.restart",
 }
+AGENT_PROTOCOL_VERSION = "1"
 
 LOGGER = logging.getLogger("monitor.server")
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
@@ -87,6 +96,13 @@ class DockerStatsPayload(BaseModel):
     cpu_percent: float | None = Field(default=None, ge=0, le=100)
     memory_usage: int | None = Field(default=None, ge=0)
     memory_limit: int | None = Field(default=None, ge=0)
+
+
+class DockerInventoryEnvelope(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    ok: bool = Field(default=True, strict=True)
+    error: str | None = Field(default=None, max_length=512)
 
 
 class CommandResultPayload(BaseModel):
@@ -191,6 +207,7 @@ async def _lifespan(app: FastAPI) -> Any:
     config: ServerConfig = app.state.config
     _validate_startup_security(config)
     app.state.db.init()
+    await app.state.alert_notifier.start()
     app.state.status_task = asyncio.create_task(_status_watcher(app))
     _install_sighup_reload(app)
     try:
@@ -203,6 +220,7 @@ async def _lifespan(app: FastAPI) -> Any:
                 await task
             except asyncio.CancelledError:
                 pass
+        await app.state.alert_notifier.stop()
         app.state.db.close()
 
 
@@ -213,10 +231,32 @@ def create_app(config: ServerConfig) -> FastAPI:
     app.add_middleware(SecurityHeadersMiddleware)
     app.state.config = config
     app.state.db = Database(config.database_path)
-    app.state.hub = ConnectionHub()
+    app.state.hub = ConnectionHub(send_timeout_seconds=config.command.send_timeout_seconds)
+    app.state.alert_notifier = AlertNotifier(config.alert_notifications, app.state.db.add_security_event)
     app.state.status_task = None
     app.state.reload_lock = asyncio.Lock()
     app.state.last_rollup_at = 0.0
+    app.state.metrics_maintenance = {
+        "running": False,
+        "last_started_at": None,
+        "last_completed_at": None,
+        "last_duration_ms": None,
+        "last_error": None,
+        "last_result": {},
+    }
+    app.state.status_watcher_health = {
+        "cycle_running": False,
+        "cycles_completed": 0,
+        "total_failures": 0,
+        "consecutive_failures": 0,
+        "last_started_at": None,
+        "last_success_at": None,
+        "last_failure_at": None,
+        "last_duration_ms": None,
+        "last_error": None,
+        "last_failure_error": None,
+        "next_retry_seconds": 5.0,
+    }
     app.state.login_limiter = FailureRateLimiter(
         config.auth_rate_limit.window_seconds,
         config.auth_rate_limit.login_max_failures,
@@ -229,26 +269,40 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, Any]:
         database = app.state.db.health_summary(public=True)
+        watcher_running = app.state.status_task is not None and not app.state.status_task.done()
         return {
-            "status": "ok",
+            "status": "ok" if watcher_running else "degraded",
             "version": app.version,
             "database": "ok",
             "wal": database["journal_mode"] == "wal",
+            "background": "ok" if watcher_running else "stopped",
         }
 
     @app.get("/api/admin/health")
     async def admin_health(_: AuthContext = Depends(require_permission("*"))) -> dict[str, Any]:
+        watcher_running = app.state.status_task is not None and not app.state.status_task.done()
         return {
-            "status": "ok",
+            "status": "ok" if watcher_running else "degraded",
             "version": app.version,
             "database": app.state.db.health_summary(public=False),
-            "background": {"status_watcher": app.state.status_task is not None and not app.state.status_task.done()},
+            "background": {
+                "status_watcher": watcher_running,
+                "status_watcher_health": dict(app.state.status_watcher_health),
+                "metrics_maintenance": dict(app.state.metrics_maintenance),
+                "alert_notifications": app.state.alert_notifier.status(),
+            },
             "config": {
                 "environment": config.environment,
                 "config_path": str(config.config_path) if config.config_path else "",
                 "command_timeout_seconds": config.command.timeout_seconds,
+                "command_send_timeout_seconds": config.command.send_timeout_seconds,
                 "raw_metrics_days": config.retention.raw_metrics_days,
                 "rollup_interval_seconds": config.retention.rollup_interval_seconds,
+                "maintenance_batch_size": config.retention.maintenance_batch_size,
+                "alert_notifications_enabled": config.alert_notifications.enabled,
+                "alert_webhooks": len(
+                    [webhook for webhook in config.alert_notifications.webhooks if webhook.enabled]
+                ),
             },
         }
 
@@ -337,7 +391,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         metric_range: str = Query("1h", alias="range"),
         _: AuthContext = Depends(require_permission("metrics:read")),
     ) -> dict[str, Any]:
-        if metric_range not in {"1h", "7d", "30d"}:
+        if metric_range not in SUPPORTED_METRIC_RANGES:
             raise HTTPException(status_code=400, detail="unsupported metric range")
         return app.state.db.list_metric_series(node_id, range_name=metric_range)
 
@@ -496,6 +550,26 @@ def create_app(config: ServerConfig) -> FastAPI:
         if sent:
             app.state.db.mark_command_sent(command["id"])
             command = app.state.db.get_command(command["id"])
+        else:
+            message = "agent is not connected or command delivery failed"
+            command = app.state.db.mark_command_send_failed(command["id"], message) or command
+            app.state.db.add_audit_log(
+                user=auth.actor,
+                action=action,
+                target=container_id,
+                node_id=node_id,
+                result="send_failed",
+            )
+            app.state.db.add_security_event(
+                event_type="command_delivery_failed",
+                actor=auth.actor,
+                client_ip=_client_host(request),
+                user_agent=request.headers.get("user-agent"),
+                node_id=node_id,
+                target=command["id"],
+                result="send_failed",
+                detail={"action": action, "container_id": container_id},
+            )
 
         await app.state.hub.broadcast_ui({"type": "command_updated", "command": command})
         return command
@@ -509,7 +583,7 @@ def create_app(config: ServerConfig) -> FastAPI:
                 client_ip=_ws_client_host(websocket),
                 result="insecure_transport",
             )
-            await websocket.close(code=1008)
+            await _reject_agent_websocket(websocket, "insecure_transport")
             return
 
         limiter: FailureRateLimiter = app.state.ws_limiter
@@ -520,7 +594,7 @@ def create_app(config: ServerConfig) -> FastAPI:
                 client_ip=_ws_client_host(websocket),
                 result="rejected",
             )
-            await websocket.close(code=1008)
+            await _reject_agent_websocket(websocket, "rate_limited")
             return
 
         auth = await _receive_ws_auth(websocket)
@@ -531,11 +605,24 @@ def create_app(config: ServerConfig) -> FastAPI:
                 client_ip=_ws_client_host(websocket),
                 result="missing_auth",
             )
-            await websocket.close(code=1008)
+            await _reject_agent_websocket(websocket, "authentication_required")
             return
 
         token = str(auth.get("token") or "")
         node_id = str(auth.get("agent_id") or auth.get("node_id") or "")
+        protocol_version = str(auth.get("protocol_version") or AGENT_PROTOCOL_VERSION)
+        if protocol_version != AGENT_PROTOCOL_VERSION:
+            limiter.add_failure(rate_key)
+            app.state.db.add_security_event(
+                event_type="agent_protocol_rejected",
+                actor=node_id or None,
+                client_ip=_ws_client_host(websocket),
+                node_id=node_id or None,
+                result="unsupported_protocol",
+                detail={"received": protocol_version, "supported": AGENT_PROTOCOL_VERSION},
+            )
+            await _reject_agent_websocket(websocket, "unsupported_protocol")
+            return
         credential = verify_agent_credentials(config, node_id, token)
 
         if credential is None:
@@ -547,7 +634,25 @@ def create_app(config: ServerConfig) -> FastAPI:
                 node_id=node_id or None,
                 result="invalid_credentials",
             )
-            await websocket.close(code=1008)
+            await _reject_agent_websocket(websocket, "invalid_credentials")
+            return
+
+        credential_fingerprint = _agent_credential_fingerprint(credential)
+        if app.state.db.is_agent_credential_revoked(
+            node_id,
+            credential_fingerprint,
+            credential.token_id,
+        ):
+            limiter.add_failure(rate_key)
+            app.state.db.add_security_event(
+                event_type="agent_revoked_credential_rejected",
+                actor=node_id,
+                client_ip=_ws_client_host(websocket),
+                node_id=node_id,
+                result="revoked_credentials",
+                detail={"token_id": credential.token_id},
+            )
+            await _reject_agent_websocket(websocket, "revoked_credentials")
             return
 
         limiter.reset(rate_key)
@@ -555,7 +660,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         registered = await app.state.hub.register_agent(
             node_id,
             websocket,
-            credential_fingerprint=_agent_credential_fingerprint(credential),
+            credential_fingerprint=credential_fingerprint,
         )
         if not registered:
             app.state.db.add_security_event(
@@ -565,7 +670,7 @@ def create_app(config: ServerConfig) -> FastAPI:
                 node_id=node_id,
                 result="rejected",
             )
-            await websocket.close(code=1008)
+            await _reject_agent_websocket(websocket, "duplicate_node_connection")
             return
         app.state.db.ensure_node(node_id, agent_name)
         app.state.db.mark_seen(node_id)
@@ -578,7 +683,9 @@ def create_app(config: ServerConfig) -> FastAPI:
             detail={"token_id": credential.token_id},
         )
         await app.state.hub.broadcast_ui({"type": "node_connected", "node_id": node_id})
-        await websocket.send_json({"type": "auth_ok", "node_id": node_id})
+        await websocket.send_json(
+            {"type": "auth_ok", "node_id": node_id, "protocol_version": AGENT_PROTOCOL_VERSION}
+        )
 
         try:
             while True:
@@ -644,6 +751,20 @@ def create_app(config: ServerConfig) -> FastAPI:
     return app
 
 
+async def _reject_agent_websocket(websocket: WebSocket, error: str) -> None:
+    try:
+        await websocket.send_json(
+            {
+                "type": "auth_error",
+                "error": error,
+                "protocol_version": AGENT_PROTOCOL_VERSION,
+            }
+        )
+    except Exception:
+        LOGGER.debug("Could not send Agent authentication error", exc_info=True)
+    await websocket.close(code=1008)
+
+
 async def _receive_ws_auth(websocket: WebSocket) -> dict[str, Any] | None:
     try:
         message = await asyncio.wait_for(websocket.receive_json(), timeout=5)
@@ -655,6 +776,11 @@ async def _receive_ws_auth(websocket: WebSocket) -> dict[str, Any] | None:
 
 
 def _validate_startup_security(config: ServerConfig) -> None:
+    try:
+        validate_alert_notification_config(config.alert_notifications, config.environment)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid alert notification configuration: {exc}") from exc
+
     weak_values = {
         "admin_token": "dev-admin-token",
         "session_secret": "dev-session-secret-change-me",
@@ -848,7 +974,13 @@ async def _reload_runtime_config(
 
         loaded = load_server_config(str(current.config_path))
         _validate_startup_security(loaded)
+        replacement_notifier = AlertNotifier(loaded.alert_notifications, app.state.db.add_security_event)
+        await replacement_notifier.start()
         _apply_runtime_config(current, loaded)
+        previous_notifier = app.state.alert_notifier
+        app.state.alert_notifier = replacement_notifier
+        await previous_notifier.stop(reason="config_reload")
+        app.state.hub.set_send_timeout_seconds(current.command.send_timeout_seconds)
         disconnected = await _disconnect_agents_with_stale_credentials(app)
 
         app.state.db.add_security_event(
@@ -863,6 +995,9 @@ async def _reload_runtime_config(
                 "api_tokens": len(current.api_tokens),
                 "users": len(current.users),
                 "roles": sorted(current.roles),
+                "alert_webhooks": len(
+                    [webhook for webhook in current.alert_notifications.webhooks if webhook.enabled]
+                ),
                 "disconnected_agents": disconnected,
             },
         )
@@ -873,6 +1008,9 @@ async def _reload_runtime_config(
             "api_tokens": len(current.api_tokens),
             "users": len(current.users),
             "roles": sorted(current.roles),
+            "alert_webhooks": len(
+                [webhook for webhook in current.alert_notifications.webhooks if webhook.enabled]
+            ),
             "disconnected_agents": disconnected,
         }
 
@@ -885,6 +1023,9 @@ def _apply_runtime_config(current: ServerConfig, loaded: ServerConfig) -> None:
     current.roles = loaded.roles
     current.api_tokens = loaded.api_tokens
     current.agents = loaded.agents
+    current.command = loaded.command
+    current.retention = loaded.retention
+    current.alert_notifications = loaded.alert_notifications
 
 
 async def _disconnect_agents_with_stale_credentials(app: FastAPI) -> list[str]:
@@ -893,7 +1034,11 @@ async def _disconnect_agents_with_stale_credentials(app: FastAPI) -> list[str]:
     hub: ConnectionHub = app.state.hub
     for node_id in await hub.connected_agent_ids():
         fingerprint = await hub.agent_credential_fingerprint(node_id)
-        if fingerprint and fingerprint in _enabled_agent_fingerprints(config, node_id):
+        if (
+            fingerprint
+            and fingerprint in _enabled_agent_fingerprints(config, node_id)
+            and not app.state.db.is_agent_credential_revoked(node_id, fingerprint)
+        ):
             continue
         if await hub.disconnect_agent(node_id, code=1008, reason="agent credential changed"):
             disconnected.append(node_id)
@@ -913,14 +1058,24 @@ async def _revoke_agent_runtime(
     client_ip: str | None = None,
     user_agent: str | None = None,
 ) -> dict[str, Any] | None:
-    revoked = 0
     config: ServerConfig = app.state.config
-    for credential in config.agents:
-        if credential.node_id == node_id and credential.enabled:
-            credential.enabled = False
-            revoked += 1
-    if revoked == 0:
+    credentials = [
+        credential
+        for credential in config.agents
+        if credential.node_id == node_id and credential.enabled
+    ]
+    if not credentials:
         return None
+
+    persisted = app.state.db.revoke_agent_credentials(
+        node_id,
+        [(_agent_credential_fingerprint(credential), credential.token_id) for credential in credentials],
+        revoked_by=actor,
+        client_ip=client_ip,
+    )
+    for credential in credentials:
+        credential.enabled = False
+    revoked = len(credentials)
 
     disconnected = await app.state.hub.disconnect_agent(node_id, code=1008, reason="agent token revoked")
     app.state.db.add_security_event(
@@ -930,12 +1085,22 @@ async def _revoke_agent_runtime(
         user_agent=user_agent,
         node_id=node_id,
         result="accepted",
-        detail={"credentials_revoked": revoked, "disconnected": disconnected},
+        detail={
+            "credentials_revoked": revoked,
+            "revocations_persisted": persisted,
+            "disconnected": disconnected,
+        },
     )
     await app.state.hub.broadcast_ui(
         {"type": "agent_token_revoked", "node_id": node_id, "disconnected": disconnected}
     )
-    return {"node_id": node_id, "revoked": True, "credentials_revoked": revoked, "disconnected": disconnected}
+    return {
+        "node_id": node_id,
+        "revoked": True,
+        "credentials_revoked": revoked,
+        "revocations_persisted": persisted,
+        "disconnected": disconnected,
+    }
 
 
 def _enabled_agent_fingerprints(config: ServerConfig, node_id: str) -> set[str]:
@@ -1001,10 +1166,42 @@ async def _handle_agent_message(app: FastAPI, node_id: str, message: dict[str, A
                 detail={"alert_id": alert.get("id"), "threshold": alert.get("threshold"), "value": alert.get("value")},
             )
             await hub.broadcast_ui(event)
+            notifier = getattr(app.state, "alert_notifier", None)
+            if notifier is not None:
+                notifier.enqueue(event)
         await hub.broadcast_ui({"type": "metrics_updated", "node_id": node_id})
         return
 
     if message_type == "docker_inventory":
+        try:
+            collection = DockerInventoryEnvelope.model_validate(data)
+        except ValidationError as exc:
+            db.add_security_event(
+                event_type="agent_payload_invalid",
+                actor=node_id,
+                node_id=node_id,
+                result="rejected",
+                detail={"message_type": message_type, "errors": exc.errors()},
+            )
+            return
+        if not collection.ok:
+            error = collection.error or "docker inventory collection failed"
+            db.mark_inventory_failed(node_id, error)
+            db.add_security_event(
+                event_type="docker_inventory_collection_failed",
+                actor=node_id,
+                node_id=node_id,
+                result="stale",
+                detail={"error": error},
+            )
+            await hub.broadcast_ui(
+                {
+                    "type": "docker_inventory_stale",
+                    "node_id": node_id,
+                    "error": error,
+                }
+            )
+            return
         containers = _bounded_list(
             data.get("containers") or [],
             config.agent_payload_limits.max_containers,
@@ -1149,48 +1346,207 @@ async def _handle_agent_message(app: FastAPI, node_id: str, message: dict[str, A
         return
 
 
-async def _status_watcher(app: FastAPI) -> None:
+def _run_metrics_maintenance(
+    db: Database,
+    *,
+    include_rollup: bool,
+    raw_metrics_days: int,
+    hourly_rollup_days: int,
+    daily_rollup_days: int,
+    batch_size: int,
+) -> dict[str, Any]:
+    maintenance_db = Database(db.path)
+    try:
+        rollups = {"hourly": 0, "daily": 0, "hourly_source_rows": 0, "daily_source_rows": 0}
+        pruned_rollups = {"hourly": 0, "daily": 0}
+        if include_rollup:
+            rollups = maintenance_db.rollup_metrics()
+            pruned_rollups = maintenance_db.prune_rollups(
+                hourly_days=hourly_rollup_days,
+                daily_days=daily_rollup_days,
+                batch_size=batch_size,
+            )
+        pruned_raw = maintenance_db.prune_metrics(raw_metrics_days, batch_size=batch_size)
+        return {
+            "rollup_ran": include_rollup,
+            "rollups": rollups,
+            "pruned_rollups": pruned_rollups,
+            "pruned_raw": pruned_raw,
+        }
+    finally:
+        maintenance_db.close()
+
+
+async def _maintain_metrics(app: FastAPI, include_rollup: bool) -> None:
     config: ServerConfig = app.state.config
-    while True:
-        await asyncio.sleep(5)
-        changes = app.state.db.update_stale_node_statuses(
-            warning_after_seconds=config.heartbeat.warning_after_seconds,
-            offline_after_seconds=config.heartbeat.offline_after_seconds,
+    status = app.state.metrics_maintenance
+    started = time.perf_counter()
+    status.update(
+        {
+            "running": True,
+            "last_started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "last_error": None,
+        }
+    )
+    try:
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                _run_metrics_maintenance,
+                app.state.db,
+                include_rollup=include_rollup,
+                raw_metrics_days=config.retention.raw_metrics_days,
+                hourly_rollup_days=config.retention.hourly_rollup_days,
+                daily_rollup_days=config.retention.daily_rollup_days,
+                batch_size=config.retention.maintenance_batch_size,
+            )
         )
-        for change in changes:
-            await app.state.hub.broadcast_ui({"type": "node_status_changed", **change})
-        for command in app.state.db.expire_stale_commands(config.command.timeout_seconds):
-            app.state.db.add_audit_log(
-                user="system",
-                action=command["action"],
-                target=str(command["payload"].get("container_id")),
-                node_id=command["node_id"],
-                result="timeout",
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await worker
+            raise
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        status.update(
+            {
+                "last_completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "last_duration_ms": duration_ms,
+                "last_result": result,
+            }
+        )
+        if include_rollup and (
+            result["rollups"]["hourly"]
+            or result["rollups"]["daily"]
+            or any(result["pruned_rollups"].values())
+        ):
+            app.state.db.add_security_event(
+                event_type="metrics_rollup_completed",
+                actor="system",
+                result="success",
+                detail={**result, "duration_ms": duration_ms},
             )
-            await app.state.hub.broadcast_ui({"type": "command_updated", "command": command})
-        now = time.monotonic()
-        if now - app.state.last_rollup_at >= max(60, config.retention.rollup_interval_seconds):
-            app.state.last_rollup_at = now
-            rollups = app.state.db.rollup_metrics()
-            pruned_rollups = app.state.db.prune_rollups(
-                hourly_days=config.retention.hourly_rollup_days,
-                daily_days=config.retention.daily_rollup_days,
-            )
-            if any(rollups.values()) or any(pruned_rollups.values()):
-                app.state.db.add_security_event(
-                    event_type="metrics_rollup_completed",
-                    actor="system",
-                    result="success",
-                    detail={"rollups": rollups, "pruned": pruned_rollups},
-                )
-        pruned = app.state.db.prune_metrics(config.retention.raw_metrics_days)
-        if pruned:
+        if result["pruned_raw"]:
             app.state.db.add_security_event(
                 event_type="metrics_retention_pruned",
                 actor="system",
                 result="success",
-                detail={"rows": pruned},
+                detail={"rows": result["pruned_raw"], "duration_ms": duration_ms},
             )
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        status.update(
+            {
+                "last_completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "last_duration_ms": duration_ms,
+                "last_error": str(exc),
+            }
+        )
+        LOGGER.exception("Metrics maintenance failed")
+        app.state.db.add_security_event(
+            event_type="metrics_maintenance_failed",
+            actor="system",
+            result="failed",
+            detail={"error": str(exc), "duration_ms": duration_ms},
+        )
+    finally:
+        status["running"] = False
+
+
+async def _status_watcher_cycle(app: FastAPI) -> None:
+    config: ServerConfig = app.state.config
+    changes = app.state.db.update_stale_node_statuses(
+        warning_after_seconds=config.heartbeat.warning_after_seconds,
+        offline_after_seconds=config.heartbeat.offline_after_seconds,
+    )
+    for change in changes:
+        await app.state.hub.broadcast_ui({"type": "node_status_changed", **change})
+    for command in app.state.db.expire_stale_commands(config.command.timeout_seconds):
+        app.state.db.add_audit_log(
+            user="system",
+            action=command["action"],
+            target=str(command["payload"].get("container_id")),
+            node_id=command["node_id"],
+            result="timeout",
+        )
+        await app.state.hub.broadcast_ui({"type": "command_updated", "command": command})
+    now = time.monotonic()
+    include_rollup = now - app.state.last_rollup_at >= config.retention.rollup_interval_seconds
+    if include_rollup:
+        app.state.last_rollup_at = now
+    await _maintain_metrics(app, include_rollup)
+
+
+def _record_status_watcher_failure(app: FastAPI, error: Exception, failures: int, duration_ms: float) -> None:
+    if failures != 1 and failures % 12 != 0:
+        return
+    try:
+        app.state.db.add_security_event(
+            event_type="status_watcher_failed",
+            actor="system",
+            result="failed",
+            detail={
+                "error": str(error),
+                "consecutive_failures": failures,
+                "duration_ms": duration_ms,
+            },
+        )
+    except Exception:
+        LOGGER.exception("Could not persist status watcher failure audit event")
+
+
+async def _status_watcher(
+    app: FastAPI,
+    interval_seconds: float = 5.0,
+    max_retry_seconds: float = 30.0,
+) -> None:
+    retry_seconds = max(0.01, interval_seconds)
+    while True:
+        app.state.status_watcher_health["next_retry_seconds"] = retry_seconds
+        await asyncio.sleep(retry_seconds)
+        status = app.state.status_watcher_health
+        started = time.perf_counter()
+        status.update(
+            {
+                "cycle_running": True,
+                "last_started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+        )
+        try:
+            await _status_watcher_cycle(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            failures = int(status["consecutive_failures"]) + 1
+            retry_seconds = min(max_retry_seconds, max(interval_seconds, interval_seconds * (2**failures)))
+            failure_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            status.update(
+                {
+                    "total_failures": int(status["total_failures"]) + 1,
+                    "consecutive_failures": failures,
+                    "last_failure_at": failure_at,
+                    "last_duration_ms": duration_ms,
+                    "last_error": str(exc),
+                    "last_failure_error": str(exc),
+                    "next_retry_seconds": retry_seconds,
+                }
+            )
+            LOGGER.exception("Status watcher cycle failed; retrying in %.2f seconds", retry_seconds)
+            _record_status_watcher_failure(app, exc, failures, duration_ms)
+        else:
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            retry_seconds = max(0.01, interval_seconds)
+            status.update(
+                {
+                    "cycles_completed": int(status["cycles_completed"]) + 1,
+                    "consecutive_failures": 0,
+                    "last_success_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "last_duration_ms": duration_ms,
+                    "last_error": None,
+                    "next_retry_seconds": retry_seconds,
+                }
+            )
+        finally:
+            status["cycle_running"] = False
 
 
 def _bounded_list(value: Any, limit: int, node_id: str, message_type: str) -> list[dict[str, Any]]:

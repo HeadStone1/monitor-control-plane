@@ -9,6 +9,18 @@ from pathlib import Path
 from typing import Any
 
 
+METRIC_RANGE_CONFIG: dict[str, dict[str, Any]] = {
+    "1h": {"duration": timedelta(hours=1), "bucket": "raw", "limit": 1000, "table": ""},
+    "24h": {"duration": timedelta(hours=24), "bucket": "hour", "limit": 25000, "table": "metrics_hourly"},
+    "7d": {"duration": timedelta(days=7), "bucket": "hour", "limit": 200000, "table": "metrics_hourly"},
+    "15d": {"duration": timedelta(days=15), "bucket": "hour", "limit": 300000, "table": "metrics_hourly"},
+    "30d": {"duration": timedelta(days=30), "bucket": "day", "limit": 750000, "table": "metrics_daily"},
+    "60d": {"duration": timedelta(days=60), "bucket": "day", "limit": 750000, "table": "metrics_daily"},
+    "90d": {"duration": timedelta(days=90), "bucket": "day", "limit": 750000, "table": "metrics_daily"},
+}
+SUPPORTED_METRIC_RANGES = frozenset(METRIC_RANGE_CONFIG)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -285,39 +297,6 @@ def _aggregate_point_metric(prefix: str, rows: list[dict[str, Any]], key: str) -
     }
 
 
-def _rollup_record(
-    node_id: str,
-    bucket_start: str,
-    rows: list[dict[str, Any]],
-    bucket: str,
-    updated_at: str,
-) -> dict[str, Any]:
-    cpu = _series_summary(rows, "cpu_percent")
-    memory = _series_summary(rows, "memory_percent")
-    disk = _series_summary(rows, "disk_percent")
-    return {
-        "node_id": node_id,
-        "bucket_start": bucket_start,
-        "bucket_end": _bucket_end(bucket_start, bucket),
-        "sample_count": len(rows),
-        "cpu_avg": cpu["avg"],
-        "cpu_max": cpu["max"],
-        "cpu_peak_at": cpu["peak_at"],
-        "memory_avg": memory["avg"],
-        "memory_max": memory["max"],
-        "memory_peak_at": memory["peak_at"],
-        "disk_avg": disk["avg"],
-        "disk_max": disk["max"],
-        "disk_peak_at": disk["peak_at"],
-        "load1": _average(_metric_values(rows, "load1")),
-        "load5": _average(_metric_values(rows, "load5")),
-        "load15": _average(_metric_values(rows, "load15")),
-        "net_rx": _average(_metric_values(rows, "net_rx")),
-        "net_tx": _average(_metric_values(rows, "net_tx")),
-        "updated_at": updated_at,
-    }
-
-
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -325,6 +304,9 @@ class Database:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
 
     def init(self) -> None:
         with self._lock, self._conn:
@@ -343,6 +325,10 @@ class Database:
                     agent_version TEXT,
                     docker_available INTEGER NOT NULL DEFAULT 0,
                     docker_version TEXT,
+                    docker_inventory_status TEXT NOT NULL DEFAULT 'unknown',
+                    docker_inventory_error TEXT,
+                    docker_inventory_last_attempt_at TEXT,
+                    docker_inventory_last_success_at TEXT,
                     status TEXT NOT NULL DEFAULT 'offline',
                     last_seen TEXT,
                     created_at TEXT NOT NULL,
@@ -366,6 +352,9 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_metrics_node_time
                     ON metrics(node_id, captured_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_metrics_time
+                    ON metrics(captured_at);
 
                 CREATE TABLE IF NOT EXISTS metrics_hourly (
                     node_id TEXT NOT NULL,
@@ -496,6 +485,19 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_alerts_status_time
                     ON alerts(status, triggered_at DESC);
+
+                CREATE TABLE IF NOT EXISTS agent_token_revocations (
+                    node_id TEXT NOT NULL,
+                    credential_fingerprint TEXT NOT NULL,
+                    token_id TEXT NOT NULL DEFAULT '',
+                    revoked_at TEXT NOT NULL,
+                    revoked_by TEXT NOT NULL,
+                    client_ip TEXT,
+                    PRIMARY KEY(node_id, credential_fingerprint)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_agent_token_revocations_node_token
+                    ON agent_token_revocations(node_id, token_id);
                 """
             )
             self._ensure_column("audit_logs", "event_type", "TEXT")
@@ -505,6 +507,10 @@ class Database:
             self._ensure_column("audit_logs", "detail_json", "TEXT")
             self._ensure_column("commands", "acknowledged_at", "TEXT")
             self._ensure_column("commands", "running_at", "TEXT")
+            self._ensure_column("nodes", "docker_inventory_status", "TEXT NOT NULL DEFAULT 'unknown'")
+            self._ensure_column("nodes", "docker_inventory_error", "TEXT")
+            self._ensure_column("nodes", "docker_inventory_last_attempt_at", "TEXT")
+            self._ensure_column("nodes", "docker_inventory_last_success_at", "TEXT")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         existing = {
@@ -538,6 +544,9 @@ class Database:
             active_alerts = int(
                 self._conn.execute("SELECT COUNT(*) FROM alerts WHERE status = 'active'").fetchone()[0]
             )
+            revoked_agent_tokens = int(
+                self._conn.execute("SELECT COUNT(*) FROM agent_token_revocations").fetchone()[0]
+            )
             pending_commands = int(
                 self._conn.execute(
                     """
@@ -558,8 +567,67 @@ class Database:
             "hourly_rollups": hourly_count,
             "daily_rollups": daily_count,
             "active_alerts": active_alerts,
+            "revoked_agent_tokens": revoked_agent_tokens,
             "pending_commands": pending_commands,
         }
+
+    def revoke_agent_credentials(
+        self,
+        node_id: str,
+        credentials: list[tuple[str, str]],
+        revoked_by: str,
+        client_ip: str | None,
+    ) -> int:
+        unique_credentials = {
+            (fingerprint, token_id)
+            for fingerprint, token_id in credentials
+            if fingerprint
+        }
+        if not node_id or not unique_credentials:
+            return 0
+        now = utc_now()
+        with self._lock, self._conn:
+            for fingerprint, token_id in unique_credentials:
+                self._conn.execute(
+                    """
+                    INSERT INTO agent_token_revocations (
+                        node_id, credential_fingerprint, token_id,
+                        revoked_at, revoked_by, client_ip
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id, credential_fingerprint) DO UPDATE SET
+                        token_id = excluded.token_id,
+                        revoked_at = excluded.revoked_at,
+                        revoked_by = excluded.revoked_by,
+                        client_ip = excluded.client_ip
+                    """,
+                    (node_id, fingerprint, token_id, now, revoked_by, client_ip),
+                )
+        return len(unique_credentials)
+
+    def is_agent_credential_revoked(
+        self,
+        node_id: str,
+        credential_fingerprint: str,
+        token_id: str = "",
+    ) -> bool:
+        if not node_id or not credential_fingerprint:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1
+                FROM agent_token_revocations
+                WHERE node_id = ?
+                  AND (
+                    credential_fingerprint = ?
+                    OR (? <> '' AND token_id = ?)
+                  )
+                LIMIT 1
+                """,
+                (node_id, credential_fingerprint, token_id, token_id),
+            ).fetchone()
+        return row is not None
 
     def ensure_node(self, node_id: str, name: str | None = None) -> None:
         now = utc_now()
@@ -814,6 +882,33 @@ class Database:
                 )
             else:
                 self._conn.execute("DELETE FROM containers WHERE node_id = ?", (node_id,))
+            self._conn.execute(
+                """
+                UPDATE nodes
+                SET docker_inventory_status = 'current',
+                    docker_inventory_error = NULL,
+                    docker_inventory_last_attempt_at = ?,
+                    docker_inventory_last_success_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, now, node_id),
+            )
+
+    def mark_inventory_failed(self, node_id: str, error: str | None) -> None:
+        now = utc_now()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE nodes
+                SET docker_inventory_status = 'stale',
+                    docker_inventory_error = ?,
+                    docker_inventory_last_attempt_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (error, now, now, node_id),
+            )
 
     def update_container_stats(self, node_id: str, stats: list[dict[str, Any]]) -> None:
         now = utc_now()
@@ -866,6 +961,21 @@ class Database:
                 """,
                 (now, now, command_id),
             )
+
+    def mark_command_send_failed(self, command_id: str, message: str) -> dict[str, Any] | None:
+        now = utc_now()
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE commands
+                SET status = 'send_failed', result_message = ?, finished_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (message, now, now, command_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_command(command_id)
 
     def mark_command_acknowledged(self, command_id: str, node_id: str) -> dict[str, Any] | None:
         now = utc_now()
@@ -1024,95 +1134,140 @@ class Database:
 
     def rollup_metrics(self) -> dict[str, int]:
         with self._lock, self._conn:
-            rows = self._conn.execute(
-                """
-                SELECT *
-                FROM metrics
-                ORDER BY node_id ASC, captured_at ASC
-                """
-            ).fetchall()
-            raw_rows = [_row_to_dict(row) for row in rows]
-            hourly = self._upsert_rollups("metrics_hourly", raw_rows, "hour")
-            daily = self._upsert_rollups("metrics_daily", raw_rows, "day")
-        return {"hourly": hourly, "daily": daily}
+            hourly, hourly_source_rows = self._rollup_metric_table("metrics_hourly", "hour")
+            daily, daily_source_rows = self._rollup_metric_table("metrics_daily", "day")
+        return {
+            "hourly": hourly,
+            "daily": daily,
+            "hourly_source_rows": hourly_source_rows,
+            "daily_source_rows": daily_source_rows,
+        }
 
-    def _upsert_rollups(self, table: str, rows: list[dict[str, Any]], bucket: str) -> int:
-        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for row in rows:
-            captured_at = _parse_utc(str(row.get("captured_at") or ""))
-            node_id = str(row.get("node_id") or "")
-            if captured_at is None or not node_id:
-                continue
-            normalized = dict(row)
-            normalized["captured_at"] = captured_at.isoformat(timespec="seconds")
-            bucket_start = _bucket_start(captured_at, bucket).isoformat(timespec="seconds")
-            grouped.setdefault((node_id, bucket_start), []).append(normalized)
+    def _rollup_metric_table(self, table: str, bucket: str) -> tuple[int, int]:
+        if (table, bucket) not in {("metrics_hourly", "hour"), ("metrics_daily", "day")}:
+            raise ValueError("unsupported metric rollup target")
 
-        now = utc_now()
-        for (node_id, bucket_start), bucket_rows in grouped.items():
-            record = _rollup_record(node_id, bucket_start, bucket_rows, bucket, now)
+        latest_row = self._conn.execute(f"SELECT MAX(bucket_start) AS value FROM {table}").fetchone()
+        latest = _parse_utc(str(latest_row["value"] or "")) if latest_row else None
+        if latest is None:
+            earliest_row = self._conn.execute("SELECT MIN(captured_at) AS value FROM metrics").fetchone()
+            cutoff = str(earliest_row["value"] or "") if earliest_row else ""
+            if not cutoff:
+                return 0, 0
+        else:
+            now = datetime.now(timezone.utc)
+            latest = min(latest, now)
+            lookback = timedelta(hours=2) if bucket == "hour" else timedelta(days=2)
+            cutoff = (latest - lookback).isoformat(timespec="seconds")
+
+        source_rows = int(
             self._conn.execute(
-                f"""
-                INSERT INTO {table} (
-                    node_id, bucket_start, bucket_end, sample_count,
-                    cpu_avg, cpu_max, cpu_peak_at,
-                    memory_avg, memory_max, memory_peak_at,
-                    disk_avg, disk_max, disk_peak_at,
-                    load1, load5, load15, net_rx, net_tx, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(node_id, bucket_start) DO UPDATE SET
-                    bucket_end = excluded.bucket_end,
-                    sample_count = excluded.sample_count,
-                    cpu_avg = excluded.cpu_avg,
-                    cpu_max = excluded.cpu_max,
-                    cpu_peak_at = excluded.cpu_peak_at,
-                    memory_avg = excluded.memory_avg,
-                    memory_max = excluded.memory_max,
-                    memory_peak_at = excluded.memory_peak_at,
-                    disk_avg = excluded.disk_avg,
-                    disk_max = excluded.disk_max,
-                    disk_peak_at = excluded.disk_peak_at,
-                    load1 = excluded.load1,
-                    load5 = excluded.load5,
-                    load15 = excluded.load15,
-                    net_rx = excluded.net_rx,
-                    net_tx = excluded.net_tx,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    record["node_id"],
-                    record["bucket_start"],
-                    record["bucket_end"],
-                    record["sample_count"],
-                    record["cpu_avg"],
-                    record["cpu_max"],
-                    record["cpu_peak_at"],
-                    record["memory_avg"],
-                    record["memory_max"],
-                    record["memory_peak_at"],
-                    record["disk_avg"],
-                    record["disk_max"],
-                    record["disk_peak_at"],
-                    record["load1"],
-                    record["load5"],
-                    record["load15"],
-                    record["net_rx"],
-                    record["net_tx"],
-                    record["updated_at"],
-                ),
+                "SELECT COUNT(*) FROM metrics WHERE captured_at >= ? AND datetime(captured_at) IS NOT NULL",
+                (cutoff,),
+            ).fetchone()[0]
+        )
+        if source_rows == 0:
+            return 0, 0
+
+        bucket_expression = (
+            "substr(captured_at, 1, 13) || ':00:00+00:00'"
+            if bucket == "hour"
+            else "substr(captured_at, 1, 10) || 'T00:00:00+00:00'"
+        )
+        bucket_modifier = "+1 hour" if bucket == "hour" else "+1 day"
+        self._conn.execute(
+            f"""
+            WITH source AS (
+                SELECT
+                    node_id, captured_at, cpu_percent, memory_percent, disk_percent,
+                    load1, load5, load15, net_rx, net_tx,
+                    {bucket_expression} AS bucket_start
+                FROM metrics
+                WHERE captured_at >= ? AND datetime(captured_at) IS NOT NULL
+            ),
+            aggregated AS (
+                SELECT
+                    node_id, bucket_start, COUNT(*) AS sample_count,
+                    AVG(cpu_percent) AS cpu_avg, MAX(cpu_percent) AS cpu_max,
+                    AVG(memory_percent) AS memory_avg, MAX(memory_percent) AS memory_max,
+                    AVG(disk_percent) AS disk_avg, MAX(disk_percent) AS disk_max,
+                    AVG(load1) AS load1, AVG(load5) AS load5, AVG(load15) AS load15,
+                    AVG(net_rx) AS net_rx, AVG(net_tx) AS net_tx
+                FROM source
+                GROUP BY node_id, bucket_start
+            ),
+            peaks AS (
+                SELECT DISTINCT
+                    node_id,
+                    bucket_start,
+                    FIRST_VALUE(captured_at) OVER (
+                        PARTITION BY node_id, bucket_start
+                        ORDER BY (cpu_percent IS NULL), cpu_percent DESC, captured_at ASC
+                    ) AS cpu_peak_at,
+                    FIRST_VALUE(captured_at) OVER (
+                        PARTITION BY node_id, bucket_start
+                        ORDER BY (memory_percent IS NULL), memory_percent DESC, captured_at ASC
+                    ) AS memory_peak_at,
+                    FIRST_VALUE(captured_at) OVER (
+                        PARTITION BY node_id, bucket_start
+                        ORDER BY (disk_percent IS NULL), disk_percent DESC, captured_at ASC
+                    ) AS disk_peak_at
+                FROM source
             )
-        return len(grouped)
+            INSERT INTO {table} (
+                node_id, bucket_start, bucket_end, sample_count,
+                cpu_avg, cpu_max, cpu_peak_at,
+                memory_avg, memory_max, memory_peak_at,
+                disk_avg, disk_max, disk_peak_at,
+                load1, load5, load15, net_rx, net_tx, updated_at
+            )
+            SELECT
+                aggregated.node_id,
+                aggregated.bucket_start,
+                strftime('%Y-%m-%dT%H:%M:%S+00:00', datetime(aggregated.bucket_start, '{bucket_modifier}')),
+                aggregated.sample_count,
+                ROUND(aggregated.cpu_avg, 2), aggregated.cpu_max,
+                CASE WHEN aggregated.cpu_max IS NULL THEN NULL ELSE peaks.cpu_peak_at END,
+                ROUND(aggregated.memory_avg, 2), aggregated.memory_max,
+                CASE WHEN aggregated.memory_max IS NULL THEN NULL ELSE peaks.memory_peak_at END,
+                ROUND(aggregated.disk_avg, 2), aggregated.disk_max,
+                CASE WHEN aggregated.disk_max IS NULL THEN NULL ELSE peaks.disk_peak_at END,
+                ROUND(aggregated.load1, 2), ROUND(aggregated.load5, 2), ROUND(aggregated.load15, 2),
+                ROUND(aggregated.net_rx, 2), ROUND(aggregated.net_tx, 2), ?
+            FROM aggregated
+            JOIN peaks
+              ON peaks.node_id = aggregated.node_id
+             AND peaks.bucket_start = aggregated.bucket_start
+            WHERE 1
+            ON CONFLICT(node_id, bucket_start) DO UPDATE SET
+                bucket_end = excluded.bucket_end,
+                sample_count = excluded.sample_count,
+                cpu_avg = excluded.cpu_avg,
+                cpu_max = excluded.cpu_max,
+                cpu_peak_at = excluded.cpu_peak_at,
+                memory_avg = excluded.memory_avg,
+                memory_max = excluded.memory_max,
+                memory_peak_at = excluded.memory_peak_at,
+                disk_avg = excluded.disk_avg,
+                disk_max = excluded.disk_max,
+                disk_peak_at = excluded.disk_peak_at,
+                load1 = excluded.load1,
+                load5 = excluded.load5,
+                load15 = excluded.load15,
+                net_rx = excluded.net_rx,
+                net_tx = excluded.net_tx,
+                updated_at = excluded.updated_at
+            """,
+            (cutoff, utc_now()),
+        )
+        changed = int(self._conn.execute("SELECT changes()").fetchone()[0])
+        return changed, source_rows
 
     def list_metric_series(self, node_id: str, range_name: str = "1h") -> dict[str, Any]:
-        config = {
-            "1h": {"duration": timedelta(hours=1), "bucket": "raw", "limit": 1000, "table": ""},
-            "7d": {"duration": timedelta(days=7), "bucket": "hour", "limit": 200000, "table": "metrics_hourly"},
-            "30d": {"duration": timedelta(days=30), "bucket": "day", "limit": 750000, "table": "metrics_daily"},
-        }.get(range_name)
+        config = METRIC_RANGE_CONFIG.get(range_name)
         if not config:
             range_name = "1h"
-            config = {"duration": timedelta(hours=1), "bucket": "raw", "limit": 1000, "table": ""}
+            config = METRIC_RANGE_CONFIG[range_name]
 
         now = datetime.now(timezone.utc)
         start = now - config["duration"]
@@ -1352,30 +1507,46 @@ class Database:
                     )
         return [command for command_id, _ in expired if (command := self.get_command(command_id))]
 
-    def prune_metrics(self, raw_metrics_days: int) -> int:
+    def prune_metrics(self, raw_metrics_days: int, batch_size: int = 5000) -> int:
         if raw_metrics_days <= 0:
             return 0
         cutoff = datetime.now(timezone.utc) - timedelta(days=raw_metrics_days)
         with self._lock, self._conn:
             cursor = self._conn.execute(
-                "DELETE FROM metrics WHERE captured_at < ?",
-                (cutoff.isoformat(timespec="seconds"),),
+                """
+                DELETE FROM metrics
+                WHERE id IN (
+                    SELECT id FROM metrics
+                    WHERE captured_at < ?
+                    ORDER BY captured_at ASC
+                    LIMIT ?
+                )
+                """,
+                (cutoff.isoformat(timespec="seconds"), max(1, batch_size)),
             )
             return int(cursor.rowcount or 0)
 
-    def prune_rollups(self, hourly_days: int, daily_days: int) -> dict[str, int]:
+    def prune_rollups(self, hourly_days: int, daily_days: int, batch_size: int = 5000) -> dict[str, int]:
         return {
-            "hourly": self._prune_rollup_table("metrics_hourly", hourly_days),
-            "daily": self._prune_rollup_table("metrics_daily", daily_days),
+            "hourly": self._prune_rollup_table("metrics_hourly", hourly_days, batch_size),
+            "daily": self._prune_rollup_table("metrics_daily", daily_days, batch_size),
         }
 
-    def _prune_rollup_table(self, table: str, days: int) -> int:
+    def _prune_rollup_table(self, table: str, days: int, batch_size: int) -> int:
         if days <= 0:
             return 0
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         with self._lock, self._conn:
             cursor = self._conn.execute(
-                f"DELETE FROM {table} WHERE bucket_start < ?",
-                (cutoff.isoformat(timespec="seconds"),),
+                f"""
+                DELETE FROM {table}
+                WHERE rowid IN (
+                    SELECT rowid FROM {table}
+                    WHERE bucket_start < ?
+                    ORDER BY bucket_start ASC
+                    LIMIT ?
+                )
+                """,
+                (cutoff.isoformat(timespec="seconds"), max(1, batch_size)),
             )
             return int(cursor.rowcount or 0)

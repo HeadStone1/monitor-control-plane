@@ -19,6 +19,7 @@ def run_config_doctor(config: ServerConfig) -> dict[str, Any]:
     _check_agents(config, checks)
     _check_roles(config, checks)
     _check_session(config, checks)
+    _check_alert_notifications(config, checks)
     _check_production_security(config, checks)
     _check_database_path(config, checks)
 
@@ -105,6 +106,27 @@ def _check_session(config: ServerConfig, checks: list[DoctorCheck]) -> None:
         _add(checks, "session_secret", "warning", "development default session secret is configured")
         return
     _add(checks, "session_secret", "ok", "session secret length is acceptable")
+
+
+def _check_alert_notifications(config: ServerConfig, checks: list[DoctorCheck]) -> None:
+    notifications = config.alert_notifications
+    enabled = [webhook for webhook in notifications.webhooks if webhook.enabled]
+    if not notifications.enabled:
+        _add(checks, "alert_notifications", "ok", "external alert notifications are disabled")
+        return
+    if not enabled:
+        _add(checks, "alert_notifications", "warning", "notifications are enabled without an enabled webhook")
+        return
+    missing = [webhook.name for webhook in enabled if not webhook.secret]
+    if missing:
+        _add(
+            checks,
+            "alert_notifications",
+            "error",
+            f"webhook signing secrets are unavailable: {', '.join(missing)}",
+        )
+        return
+    _add(checks, "alert_notifications", "ok", f"{len(enabled)} signed webhook(s) enabled")
 
 
 def _check_production_security(config: ServerConfig, checks: list[DoctorCheck]) -> None:

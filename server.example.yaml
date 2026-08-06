@@ -72,12 +72,30 @@ agent_payload_limits:
 
 command:
   timeout_seconds: 60
+  send_timeout_seconds: 5
 
 retention:
   raw_metrics_days: 7
   hourly_rollup_days: 90
   daily_rollup_days: 365
   rollup_interval_seconds: 3600
+  maintenance_batch_size: 5000
+
+# Webhook signing secrets are read from environment variables, never YAML.
+# Production webhook URLs must use HTTPS. HTTP is only accepted for loopback
+# development endpoints. Redirects are never followed.
+alert_notifications:
+  enabled: false
+  queue_size: 100
+  worker_count: 2
+  request_timeout_seconds: 5
+  max_attempts: 3
+  retry_base_seconds: 2
+  webhooks:
+    - name: operations
+      url: https://alerts.example.com/monitor
+      secret_env: MONITOR_ALERT_WEBHOOK_SECRET
+      enabled: false
 
 heartbeat:
   warning_after_seconds: 30

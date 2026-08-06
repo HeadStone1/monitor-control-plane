@@ -1,3 +1,6 @@
+const METRIC_KEYS = ["cpu", "memory", "disk"];
+const METRIC_RANGES = new Set(["1h", "24h", "7d", "15d", "30d", "60d", "90d"]);
+
 const state = {
   username: "",
   csrfToken: "",
@@ -8,9 +11,11 @@ const state = {
   commands: [],
   auditLogs: [],
   alerts: [],
+  adminHealth: null,
   metrics: [],
   metricPayload: null,
-  metricRange: localStorage.getItem("monitor.metricRange") || "1h",
+  metricRange: loadMetricRange(),
+  visibleMetrics: loadVisibleMetrics(),
   language: loadLanguage(),
   theme: loadTheme(),
   thresholds: loadThresholds(),
@@ -19,13 +24,20 @@ const state = {
   metricZoom: null,
   chartSelection: null,
   chartModel: null,
+  chartHoverX: null,
+  hasLoaded: false,
+  isLoading: false,
+  refreshError: "",
   currentPage: loadPage(),
   sidebarCollapsed: loadSidebarCollapsed(),
   selectedNodeId: localStorage.getItem("monitor.selectedNodeId") || null,
   ws: null,
+  wsReconnectTimer: null,
+  wsReconnectAttempts: 0,
   refreshTimer: null,
   thresholdSaveTimer: null,
   auditFilterTimer: null,
+  chartResizeTimer: null,
 };
 
 const els = {
@@ -37,6 +49,8 @@ const els = {
   pageTitle: document.querySelector(".page-header h1"),
   logout: document.querySelector("#logout"),
   sidebarToggle: document.querySelector("#sidebar-toggle"),
+  mobileNavToggle: document.querySelector("#mobile-nav-toggle"),
+  sidebarScrim: document.querySelector("#sidebar-scrim"),
   navLinks: document.querySelectorAll("[data-page-link]"),
   pages: document.querySelectorAll("[data-page]"),
   refresh: document.querySelector("#refresh"),
@@ -46,6 +60,18 @@ const els = {
   onlineCount: document.querySelector("#online-count"),
   containerCount: document.querySelector("#container-count"),
   commandCount: document.querySelector("#command-count"),
+  adminHealthStatus: document.querySelector("#admin-health-status"),
+  adminHealthVersion: document.querySelector("#admin-health-version"),
+  adminDbMode: document.querySelector("#admin-db-mode"),
+  adminDbPath: document.querySelector("#admin-db-path"),
+  adminWatcherStatus: document.querySelector("#admin-watcher-status"),
+  adminActiveAlerts: document.querySelector("#admin-active-alerts"),
+  adminPendingCommands: document.querySelector("#admin-pending-commands"),
+  adminDbDetails: document.querySelector("#admin-db-details"),
+  adminConfigDetails: document.querySelector("#admin-config-details"),
+  adminCapacityDetails: document.querySelector("#admin-capacity-details"),
+  adminControlDetails: document.querySelector("#admin-control-details"),
+  adminReloadConfig: document.querySelector("#admin-reload-config"),
   containersTotal: document.querySelector("#containers-total"),
   containersScope: document.querySelector("#containers-scope"),
   containersRunningCount: document.querySelector("#containers-running-count"),
@@ -85,12 +111,14 @@ const els = {
   miniMemory: document.querySelector("#mini-memory"),
   miniDisk: document.querySelector("#mini-disk"),
   miniDocker: document.querySelector("#mini-docker"),
+  metricSeries: document.querySelector("#metric-series"),
   metricRange: document.querySelector("#metric-range"),
   chartZoomReset: document.querySelector("#chart-zoom-reset"),
   thresholdCpu: document.querySelector("#threshold-cpu"),
   thresholdMemory: document.querySelector("#threshold-memory"),
   thresholdDisk: document.querySelector("#threshold-disk"),
   metricSummary: document.querySelector("#metric-summary"),
+  chartContext: document.querySelector("#chart-context"),
   chart: document.querySelector("#metric-chart"),
   chartTooltip: document.querySelector("#chart-tooltip"),
   toast: document.querySelector("#toast"),
@@ -113,14 +141,68 @@ const translations = {
     "alerts.none": "No alerts.",
     "alerts.resolved": "Resolved",
     "alerts.title": "Alerts",
+    "admin.activeAlerts": "Active Alerts",
+    "admin.background": "Background",
+    "admin.capacity": "Capacity",
+    "admin.configPath": "Config path",
+    "admin.configReloaded": "Config reloaded.",
+    "admin.configReloadFailed": "Config reload failed: {message}",
+    "admin.controls": "Controls",
+    "admin.database": "Database",
+    "admin.databaseDetails": "Database Details",
+    "admin.degraded": "degraded",
+    "admin.dbDailyRollups": "Daily rollups",
+    "admin.dbHourlyRollups": "Hourly rollups",
+    "admin.dbJournalMode": "Journal mode",
+    "admin.dbNodes": "Nodes",
+    "admin.dbOnlineNodes": "Online nodes",
+    "admin.dbPath": "Path",
+    "admin.dbPendingCommands": "Pending commands",
+    "admin.dbRawMetrics": "Raw metrics",
+    "admin.dbRevokedAgentTokens": "Revoked Agent tokens",
+    "admin.dbSynchronous": "Synchronous",
+    "admin.environment": "Environment",
+    "admin.healthUnavailable": "Admin health is available to administrator roles only.",
+    "admin.maintenanceBatch": "Maintenance batch",
+    "admin.maintenanceDuration": "Last maintenance duration",
+    "admin.maintenanceError": "Last maintenance error",
+    "admin.maintenanceIdle": "idle",
+    "admin.maintenanceLastRun": "Last maintenance",
+    "admin.maintenanceRunning": "running",
+    "admin.metricsMaintenance": "Metrics maintenance",
+    "admin.pendingCommands": "pending commands",
+    "admin.rawMetricsDays": "Raw metrics days",
+    "admin.reloadConfig": "Reload config",
+    "admin.reloadDescription": "Reload runtime auth config from the configured YAML file without restarting the server.",
+    "admin.rollupInterval": "Rollup interval",
+    "admin.runtimeConfig": "Runtime Config",
+    "admin.status": "Status",
+    "admin.statusWatcher": "status watcher",
+    "admin.stopped": "stopped",
+    "admin.subtitle": "Operational health and runtime controls",
+    "admin.timeout": "Command timeout",
+    "admin.watcherCycles": "Completed cycles",
+    "admin.watcherFailures": "Watcher failures",
+    "admin.watcherLastError": "Last watcher error",
+    "admin.watcherLastSuccess": "Last watcher success",
+    "admin.watcherRetry": "Next retry",
     "audit.action": "Action",
     "audit.exportCsv": "Export CSV",
     "audit.node": "Node",
     "audit.none": "No audit logs yet.",
     "auth.signOut": "Sign out",
     "brand.subtitle": "Control Plane",
+    "chart.context": "{source} / {count} points",
+    "chart.metricRequired": "Keep at least one metric visible.",
+    "chart.metrics": "Metrics",
     "chart.noMetrics": "No metrics yet",
+    "chart.range": "Time range",
     "chart.resetZoom": "Reset zoom",
+    "chart.source.daily": "Daily aggregation",
+    "chart.source.hourly": "Hourly aggregation",
+    "chart.source.raw": "Raw samples",
+    "chart.thresholds": "Thresholds",
+    "chart.zoomed": "Zoomed",
     "commands.confirmMessage": "Confirm {action} for container {container} on node {node}. This command will be sent immediately.",
     "commands.none": "No commands yet.",
     "commands.selectNodeFirst": "Select a node first.",
@@ -135,8 +217,18 @@ const translations = {
     "dialog.confirm": "Confirm",
     "dialog.confirmCommand": "Confirm command",
     "docker.available": "Docker available",
+    "docker.inventoryStale": "Container inventory stale",
     "docker.unavailable": "Docker unavailable",
+    "empty.errorDetail": "The latest data could not be loaded.",
+    "empty.errorTitle": "Data unavailable",
+    "empty.loadingDetail": "Fetching the latest control-plane state.",
+    "empty.loadingTitle": "Loading data",
+    "empty.noAgentsDetail": "Agent data has not been received yet.",
+    "empty.noAuditDetail": "No audit events match the current view.",
+    "empty.noCommandsDetail": "No commands are recorded in the current window.",
+    "empty.noContainersDetail": "The selected node has not reported any containers.",
     "empty.noAgentSummary": "No agent nodes to summarize.",
+    "empty.retry": "Retry",
     "errors.commandFailed": "Command failed: {message}",
     "errors.invalidLogin": "Invalid username or password.",
     "errors.refreshFailed": "Refresh failed: {message}",
@@ -169,6 +261,7 @@ const translations = {
     "insights.securityEvents": "security events",
     "insights.uniqueClients": "unique clients",
     "page.auditTitle": "Audit Logs",
+    "page.adminTitle": "Admin / Health",
     "page.commandsTitle": "Commands",
     "page.containersTitle": "Containers",
     "page.overviewTitle": "Server Dashboard",
@@ -184,7 +277,15 @@ const translations = {
     "metrics.peak": "Peak {time}",
     "metrics.samples": "Samples: {count}",
     "metrics.tooltip": "{label}: avg {avg} / max {max} / peak {peak}",
+    "range.1h": "Last hour",
+    "range.24h": "Last 24 hours",
+    "range.7d": "Last 7 days",
+    "range.15d": "Last 15 days",
+    "range.30d": "Last 30 days",
+    "range.60d": "Last 60 days",
+    "range.90d": "Last 90 days",
     "nav.audit": "Audit",
+    "nav.admin": "Admin",
     "nav.commands": "Commands",
     "nav.containers": "Containers",
     "nav.overview": "Overview",
@@ -202,6 +303,7 @@ const translations = {
     "nodes.noneSelected": "No node selected",
     "nodes.waiting": "Waiting for an agent connection",
     "panels.auditLogs": "Audit Logs",
+    "panels.adminHealth": "Admin / Health",
     "panels.commands": "Commands",
     "panels.containers": "Containers",
     "panels.nodes": "Nodes",
@@ -241,14 +343,68 @@ const translations = {
     "alerts.none": "暂无告警。",
     "alerts.resolved": "已恢复",
     "alerts.title": "告警",
+    "admin.activeAlerts": "活跃告警",
+    "admin.background": "后台任务",
+    "admin.capacity": "容量",
+    "admin.configPath": "配置路径",
+    "admin.configReloaded": "配置已重载。",
+    "admin.configReloadFailed": "配置重载失败：{message}",
+    "admin.controls": "控制",
+    "admin.database": "数据库",
+    "admin.databaseDetails": "数据库详情",
+    "admin.degraded": "降级",
+    "admin.dbDailyRollups": "天级汇总",
+    "admin.dbHourlyRollups": "小时汇总",
+    "admin.dbJournalMode": "日志模式",
+    "admin.dbNodes": "节点",
+    "admin.dbOnlineNodes": "在线节点",
+    "admin.dbPath": "路径",
+    "admin.dbPendingCommands": "待处理命令",
+    "admin.dbRawMetrics": "原始指标",
+    "admin.dbRevokedAgentTokens": "已吊销 Agent token",
+    "admin.dbSynchronous": "同步级别",
+    "admin.environment": "环境",
+    "admin.healthUnavailable": "Admin Health 仅管理员角色可用。",
+    "admin.maintenanceBatch": "维护批量",
+    "admin.maintenanceDuration": "最近维护耗时",
+    "admin.maintenanceError": "最近维护错误",
+    "admin.maintenanceIdle": "空闲",
+    "admin.maintenanceLastRun": "最近维护",
+    "admin.maintenanceRunning": "运行中",
+    "admin.metricsMaintenance": "指标维护",
+    "admin.pendingCommands": "待处理命令",
+    "admin.rawMetricsDays": "原始指标天数",
+    "admin.reloadConfig": "重载配置",
+    "admin.reloadDescription": "从配置 YAML 重载运行时认证配置，无需重启服务。",
+    "admin.rollupInterval": "汇总间隔",
+    "admin.runtimeConfig": "运行配置",
+    "admin.status": "状态",
+    "admin.statusWatcher": "状态 watcher",
+    "admin.stopped": "已停止",
+    "admin.subtitle": "运行健康状态与运行时控制",
+    "admin.timeout": "命令超时",
+    "admin.watcherCycles": "已完成循环",
+    "admin.watcherFailures": "监视器失败次数",
+    "admin.watcherLastError": "最近监视器错误",
+    "admin.watcherLastSuccess": "最近监视器成功",
+    "admin.watcherRetry": "下次重试",
     "audit.action": "操作",
     "audit.exportCsv": "导出 CSV",
     "audit.node": "节点",
     "audit.none": "暂无审计日志。",
     "auth.signOut": "退出登录",
     "brand.subtitle": "控制平面",
+    "chart.context": "{source} / {count} 个数据点",
+    "chart.metricRequired": "至少保留一个可见指标。",
+    "chart.metrics": "指标",
     "chart.noMetrics": "暂无指标",
+    "chart.range": "时间范围",
     "chart.resetZoom": "重置缩放",
+    "chart.source.daily": "按天汇总",
+    "chart.source.hourly": "按小时汇总",
+    "chart.source.raw": "原始采样",
+    "chart.thresholds": "告警阈值",
+    "chart.zoomed": "已缩放",
     "commands.confirmMessage": "确认对节点 {node} 上的容器 {container} 执行 {action}？命令会立即发送。",
     "commands.none": "暂无命令。",
     "commands.selectNodeFirst": "请先选择节点。",
@@ -263,8 +419,18 @@ const translations = {
     "dialog.confirm": "确认",
     "dialog.confirmCommand": "确认命令",
     "docker.available": "Docker 可用",
+    "docker.inventoryStale": "容器清单已过期",
     "docker.unavailable": "Docker 不可用",
+    "empty.errorDetail": "暂时无法加载最新数据。",
+    "empty.errorTitle": "数据不可用",
+    "empty.loadingDetail": "正在获取控制面最新状态。",
+    "empty.loadingTitle": "正在加载",
+    "empty.noAgentsDetail": "尚未收到 Agent 数据。",
+    "empty.noAuditDetail": "当前视图中没有匹配的审计事件。",
+    "empty.noCommandsDetail": "当前时间范围内没有命令记录。",
+    "empty.noContainersDetail": "所选节点尚未上报容器。",
     "empty.noAgentSummary": "暂无可汇总的 Agent 节点。",
+    "empty.retry": "重试",
     "errors.commandFailed": "命令失败：{message}",
     "errors.invalidLogin": "用户名或密码错误。",
     "errors.refreshFailed": "刷新失败：{message}",
@@ -297,6 +463,7 @@ const translations = {
     "insights.securityEvents": "安全事件",
     "insights.uniqueClients": "独立来源",
     "page.auditTitle": "审计日志",
+    "page.adminTitle": "管理 / 健康",
     "page.commandsTitle": "命令",
     "page.containersTitle": "容器",
     "page.overviewTitle": "服务端仪表盘",
@@ -312,7 +479,15 @@ const translations = {
     "metrics.peak": "峰值 {time}",
     "metrics.samples": "样本：{count}",
     "metrics.tooltip": "{label}：平均 {avg} / 最高 {max} / 峰值 {peak}",
+    "range.1h": "近 1 小时",
+    "range.24h": "近 24 小时",
+    "range.7d": "近 7 天",
+    "range.15d": "近 15 天",
+    "range.30d": "近 30 天",
+    "range.60d": "近 60 天",
+    "range.90d": "近 90 天",
     "nav.audit": "审计",
+    "nav.admin": "管理",
     "nav.commands": "命令",
     "nav.containers": "容器",
     "nav.overview": "概览",
@@ -330,6 +505,7 @@ const translations = {
     "nodes.noneSelected": "未选择节点",
     "nodes.waiting": "等待 Agent 连接",
     "panels.auditLogs": "审计日志",
+    "panels.adminHealth": "管理 / 健康",
     "panels.commands": "命令",
     "panels.containers": "容器",
     "panels.nodes": "节点",
@@ -364,12 +540,15 @@ const translations = {
 els.loginForm.addEventListener("submit", login);
 els.logout.addEventListener("click", () => logout());
 els.sidebarToggle.addEventListener("click", toggleSidebar);
+els.mobileNavToggle.addEventListener("click", toggleMobileSidebar);
+els.sidebarScrim.addEventListener("click", closeMobileSidebar);
 els.navLinks.forEach((link) => link.addEventListener("click", changePage));
 els.refresh.addEventListener("click", refreshAll);
 els.alertsToggle.addEventListener("click", toggleAlertPanel);
 els.themeToggle.addEventListener("click", toggleTheme);
 els.languageSelect.addEventListener("change", changeLanguage);
-els.metricRange.addEventListener("click", changeMetricRange);
+els.metricRange.addEventListener("change", changeMetricRange);
+els.metricSeries.addEventListener("click", toggleMetricSeries);
 els.chartZoomReset.addEventListener("click", () => resetMetricZoom());
 els.thresholdCpu.addEventListener("input", () => updateThreshold("cpu", els.thresholdCpu.value));
 els.thresholdMemory.addEventListener("input", () => updateThreshold("memory", els.thresholdMemory.value));
@@ -379,6 +558,7 @@ els.auditActionFilter.addEventListener("input", updateAuditFilters);
 els.auditFromFilter.addEventListener("input", updateAuditFilters);
 els.auditToFilter.addEventListener("input", updateAuditFilters);
 els.auditExport.addEventListener("click", exportAuditCsv);
+els.adminReloadConfig.addEventListener("click", reloadConfig);
 els.containerSearch.addEventListener("input", updateContainerFilters);
 els.containerStatusFilter.addEventListener("change", updateContainerFilters);
 els.chart.addEventListener("pointerdown", startChartSelection);
@@ -393,7 +573,18 @@ els.commandDialog.addEventListener("click", (event) => {
   if (event.target === els.commandDialog) closeCommandDialog(false);
 });
 window.addEventListener("hashchange", () => setPage(window.location.hash.slice(1) || "overview"));
+window.addEventListener("resize", () => {
+  clearTimeout(state.chartResizeTimer);
+  state.chartResizeTimer = setTimeout(() => {
+    applySidebarState();
+    renderChart(metricsForChart());
+  }, 120);
+});
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && isCompactNavigation() && !state.sidebarCollapsed) {
+    closeMobileSidebar();
+    return;
+  }
   if (event.key === "Escape" && !els.commandDialog.classList.contains("is-hidden")) {
     closeCommandDialog(false);
   }
@@ -452,9 +643,12 @@ async function login(event) {
 
 function logout(showMessage = true) {
   const csrfToken = state.csrfToken;
-  if (state.ws) {
-    state.ws.close();
-  }
+  clearTimeout(state.wsReconnectTimer);
+  state.wsReconnectTimer = null;
+  state.wsReconnectAttempts = 0;
+  const websocket = state.ws;
+  state.ws = null;
+  if (websocket) websocket.close();
   clearInterval(state.refreshTimer);
   state.username = "";
   state.csrfToken = "";
@@ -467,6 +661,9 @@ function logout(showMessage = true) {
   state.alerts = [];
   state.metrics = [];
   state.metricPayload = null;
+  state.hasLoaded = false;
+  state.isLoading = false;
+  state.refreshError = "";
   state.containerFilters = { query: "", status: "all" };
   els.containerSearch.value = "";
   els.containerStatusFilter.value = "all";
@@ -485,6 +682,10 @@ function logout(showMessage = true) {
 }
 
 function showLogin() {
+  if (!state.sidebarCollapsed) {
+    state.sidebarCollapsed = true;
+    applySidebarState();
+  }
   els.loginView.classList.remove("is-hidden");
   els.appView.classList.add("is-hidden");
 }
@@ -492,6 +693,7 @@ function showLogin() {
 function showApp() {
   els.loginView.classList.add("is-hidden");
   els.appView.classList.remove("is-hidden");
+  syncAdminVisibility();
   applyPage();
   const suffix = state.role ? ` / ${state.role}` : "";
   els.currentUser.textContent = state.username
@@ -512,7 +714,25 @@ function applyTheme() {
 }
 
 function toggleSidebar() {
-  state.sidebarCollapsed = !state.sidebarCollapsed;
+  setSidebarCollapsed(!state.sidebarCollapsed);
+}
+
+function toggleMobileSidebar() {
+  const opening = state.sidebarCollapsed;
+  setSidebarCollapsed(!opening);
+  if (opening) {
+    requestAnimationFrame(() => els.navLinks[0]?.focus());
+  }
+}
+
+function closeMobileSidebar() {
+  if (state.sidebarCollapsed) return;
+  setSidebarCollapsed(true);
+  els.mobileNavToggle.focus();
+}
+
+function setSidebarCollapsed(collapsed) {
+  state.sidebarCollapsed = Boolean(collapsed);
   localStorage.setItem("monitor.sidebarCollapsed", state.sidebarCollapsed ? "true" : "false");
   applySidebarState();
 }
@@ -521,6 +741,9 @@ function changePage(event) {
   event.preventDefault();
   const page = event.currentTarget.dataset.pageLink;
   setPage(page);
+  if (isCompactNavigation()) {
+    setSidebarCollapsed(true);
+  }
 }
 
 function setPage(page) {
@@ -534,6 +757,13 @@ function setPage(page) {
 }
 
 function applyPage() {
+  if (state.currentPage === "admin" && !hasScope("*")) {
+    state.currentPage = "overview";
+    localStorage.setItem("monitor.currentPage", state.currentPage);
+    if (window.location.hash === "#admin") {
+      window.history.replaceState(null, "", "#overview");
+    }
+  }
   const currentPage = normalizePage(state.currentPage);
   state.currentPage = currentPage;
   els.pages.forEach((page) => {
@@ -551,12 +781,27 @@ function applyPage() {
 
 function applySidebarState() {
   els.appView.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
+  const compact = isCompactNavigation();
+  const mobileOpen = compact && !state.sidebarCollapsed && !els.appView.classList.contains("is-hidden");
   els.sidebarToggle.setAttribute(
     "aria-label",
     state.sidebarCollapsed ? t("sidebar.expand") : t("sidebar.collapse"),
   );
   els.sidebarToggle.title = state.sidebarCollapsed ? t("sidebar.expand") : t("sidebar.collapse");
   els.sidebarToggle.dataset.label = t("nav.short");
+  els.mobileNavToggle.setAttribute("aria-expanded", mobileOpen ? "true" : "false");
+  els.mobileNavToggle.setAttribute(
+    "aria-label",
+    mobileOpen ? t("sidebar.collapse") : t("sidebar.expand"),
+  );
+  els.mobileNavToggle.title = mobileOpen ? t("sidebar.collapse") : t("sidebar.expand");
+  els.sidebarScrim.setAttribute("aria-label", t("sidebar.collapse"));
+  els.sidebarScrim.classList.toggle("is-hidden", !mobileOpen);
+  document.body.classList.toggle("mobile-nav-open", mobileOpen);
+}
+
+function isCompactNavigation() {
+  return window.matchMedia("(max-width: 1050px)").matches;
 }
 
 function applyAuthProfile(profile) {
@@ -564,6 +809,16 @@ function applyAuthProfile(profile) {
   state.csrfToken = profile.csrf_token || "";
   state.role = profile.role || "";
   state.scopes = Array.isArray(profile.scopes) ? profile.scopes : [];
+  syncAdminVisibility();
+}
+
+function syncAdminVisibility() {
+  const isAdmin = hasScope("*");
+  els.navLinks.forEach((link) => {
+    if (link.dataset.pageLink === "admin") {
+      link.classList.toggle("is-hidden", !isAdmin);
+    }
+  });
 }
 
 function changeLanguage() {
@@ -631,6 +886,8 @@ function csrfHeaders(method = "GET", token = state.csrfToken) {
 }
 
 function connectWs() {
+  clearTimeout(state.wsReconnectTimer);
+  state.wsReconnectTimer = null;
   if (state.ws) {
     state.ws.close();
   }
@@ -644,16 +901,14 @@ function connectWs() {
     ws.send(JSON.stringify({ type: "auth" }));
   });
   ws.addEventListener("close", () => {
+    if (state.ws !== ws) return;
     setWsState("disconnected");
-    if (state.username) {
-      setTimeout(() => {
-        if (state.ws === ws) connectWs();
-      }, 3000);
-    }
+    scheduleWsReconnect(ws);
   });
   ws.addEventListener("message", (event) => {
     const message = safeJson(event.data);
     if (message?.type === "auth_ok") {
+      state.wsReconnectAttempts = 0;
       setWsState("connected");
       return;
     }
@@ -673,6 +928,21 @@ function connectWs() {
   });
 }
 
+function scheduleWsReconnect(ws) {
+  if (!state.username || state.ws !== ws || state.wsReconnectTimer) return;
+  const attempt = Math.min(state.wsReconnectAttempts, 5);
+  const baseDelay = Math.min(30000, 1000 * (2 ** attempt));
+  const delay = Math.round(baseDelay * (0.8 + (Math.random() * 0.4)));
+  state.wsReconnectAttempts += 1;
+  state.wsReconnectTimer = setTimeout(() => {
+    state.wsReconnectTimer = null;
+    if (state.username && state.ws === ws) {
+      state.ws = null;
+      connectWs();
+    }
+  }, delay);
+}
+
 function setWsState(value) {
   els.wsState.textContent = t(`ws.${value}`);
 }
@@ -680,17 +950,27 @@ function setWsState(value) {
 async function refreshAll() {
   if (!state.username) return;
 
+  const firstLoad = !state.hasLoaded;
+  if (firstLoad) {
+    state.isLoading = true;
+    state.refreshError = "";
+    render();
+  }
+  els.refresh.disabled = true;
+
   try {
-    const [nodes, commands, auditLogs, alerts] = await Promise.all([
+    const [nodes, commands, auditLogs, alerts, adminHealth] = await Promise.all([
       api("/api/nodes"),
       api("/api/commands?limit=50"),
       api(auditLogPath()),
       api("/api/alerts?limit=30"),
+      hasScope("*") ? api("/api/admin/health").catch(() => null) : Promise.resolve(null),
     ]);
     state.nodes = nodes;
     state.commands = commands;
     state.auditLogs = auditLogs;
     state.alerts = alerts;
+    state.adminHealth = adminHealth;
 
     if (!state.selectedNodeId && nodes.length) {
       selectNode(nodes[0].id, false);
@@ -707,9 +987,17 @@ async function refreshAll() {
       ? await api(`/api/nodes/${encodeURIComponent(state.selectedNodeId)}/metrics?range=${encodeURIComponent(state.metricRange)}`)
       : null;
     state.metrics = state.metricPayload?.points || [];
+    state.hasLoaded = true;
+    state.isLoading = false;
+    state.refreshError = "";
     render();
   } catch (error) {
+    state.isLoading = false;
+    state.refreshError = error.message || t("empty.errorDetail");
+    if (!state.hasLoaded) render();
     showToast(t("errors.refreshFailed", { message: error.message }));
+  } finally {
+    els.refresh.disabled = false;
   }
 }
 
@@ -737,6 +1025,7 @@ function render() {
   renderChart(metricsForChart());
   renderContainers();
   renderEvents();
+  renderAdminHealth();
 }
 
 function renderPageInsights() {
@@ -765,7 +1054,7 @@ function renderContainerInsights() {
 
 function renderCommandInsights() {
   const activeStatuses = new Set(["pending", "sent", "acknowledged", "running"]);
-  const problemStatuses = new Set(["failed", "timeout"]);
+  const problemStatuses = new Set(["failed", "send_failed", "timeout"]);
   const success = state.commands.filter((command) => command.status === "success").length;
   const active = state.commands.filter((command) => activeStatuses.has(command.status)).length;
   const problem = state.commands.filter((command) => problemStatuses.has(command.status)).length;
@@ -796,6 +1085,95 @@ function renderAuditInsights() {
   els.auditFailureCount.textContent = failures;
 }
 
+function renderAdminHealth() {
+  if (!hasScope("*")) {
+    state.adminHealth = null;
+    els.adminHealthStatus.textContent = "-";
+    els.adminHealthVersion.textContent = t("admin.healthUnavailable");
+    els.adminDbMode.textContent = "-";
+    els.adminDbPath.textContent = "-";
+    els.adminWatcherStatus.textContent = "-";
+    els.adminActiveAlerts.textContent = "0";
+    els.adminPendingCommands.textContent = pendingCommandsText(0);
+    setDetailList(els.adminDbDetails, []);
+    setDetailList(els.adminConfigDetails, []);
+    setDetailList(els.adminCapacityDetails, []);
+    els.adminControlDetails.replaceChildren(createTextBlock("p", "empty", t("admin.healthUnavailable")));
+    els.adminReloadConfig.disabled = true;
+    return;
+  }
+
+  els.adminReloadConfig.disabled = false;
+  const health = state.adminHealth || {};
+  const database = health.database || {};
+  const background = health.background || {};
+  const config = health.config || {};
+  const watcherRunning = Boolean(background.status_watcher);
+  const watcherHealth = background.status_watcher_health || {};
+  const watcherDegraded = watcherRunning && Number(watcherHealth.consecutive_failures || 0) > 0;
+  const maintenance = background.metrics_maintenance || {};
+
+  els.adminHealthStatus.textContent = health.status || "-";
+  els.adminHealthVersion.textContent = health.version ? `v${health.version}` : "-";
+  els.adminDbMode.textContent = database.journal_mode || "-";
+  els.adminDbPath.textContent = compactPath(database.path);
+  els.adminWatcherStatus.textContent = watcherRunning
+    ? (watcherDegraded ? t("admin.degraded") : "ok")
+    : t("admin.stopped");
+  els.adminActiveAlerts.textContent = database.active_alerts ?? 0;
+  els.adminPendingCommands.textContent = pendingCommandsText(database.pending_commands ?? 0);
+
+  setDetailList(els.adminDbDetails, [
+    [t("admin.dbPath"), database.path || "-"],
+    [t("admin.dbJournalMode"), database.journal_mode || "-"],
+    [t("admin.dbSynchronous"), database.synchronous ?? "-"],
+    [t("admin.dbPendingCommands"), database.pending_commands ?? 0],
+    [t("admin.metricsMaintenance"), maintenance.running ? t("admin.maintenanceRunning") : t("admin.maintenanceIdle")],
+    [t("admin.maintenanceLastRun"), formatDateTime(maintenance.last_completed_at)],
+    [t("admin.maintenanceDuration"), maintenance.last_duration_ms == null ? "-" : `${maintenance.last_duration_ms} ms`],
+    [t("admin.maintenanceError"), maintenance.last_error || "-"],
+  ]);
+  setDetailList(els.adminConfigDetails, [
+    [t("admin.environment"), config.environment || "-"],
+    [t("admin.configPath"), config.config_path || "-"],
+    [t("admin.timeout"), seconds(config.command_timeout_seconds)],
+    [t("admin.rollupInterval"), seconds(config.rollup_interval_seconds)],
+    [t("admin.rawMetricsDays"), days(config.raw_metrics_days)],
+    [t("admin.maintenanceBatch"), config.maintenance_batch_size ?? "-"],
+  ]);
+  setDetailList(els.adminCapacityDetails, [
+    [t("admin.dbNodes"), database.nodes ?? 0],
+    [t("admin.dbOnlineNodes"), database.online_nodes ?? 0],
+    [t("admin.dbRawMetrics"), database.raw_metrics ?? 0],
+    [t("admin.dbHourlyRollups"), database.hourly_rollups ?? 0],
+    [t("admin.dbDailyRollups"), database.daily_rollups ?? 0],
+    [t("admin.dbRevokedAgentTokens"), database.revoked_agent_tokens ?? 0],
+  ]);
+  const watcherDetails = document.createElement("dl");
+  watcherDetails.className = "detail-list";
+  setDetailList(watcherDetails, [
+    [t("admin.watcherCycles"), watcherHealth.cycles_completed ?? 0],
+    [t("admin.watcherFailures"), watcherHealth.total_failures ?? 0],
+    [t("admin.watcherLastSuccess"), formatDateTime(watcherHealth.last_success_at)],
+    [t("admin.watcherLastError"), watcherHealth.last_failure_error || "-"],
+    [t("admin.watcherRetry"), seconds(watcherHealth.next_retry_seconds)],
+  ]);
+  els.adminControlDetails.replaceChildren(
+    createTextBlock("p", "", t("admin.reloadDescription")),
+    watcherDetails,
+  );
+}
+
+function setDetailList(target, rows) {
+  target.replaceChildren();
+  if (!rows.length) return;
+  rows.forEach(([label, value]) => {
+    const term = createTextBlock("dt", "", label);
+    const detail = createTextBlock("dd", "", value);
+    target.append(term, detail);
+  });
+}
+
 function renderOverview() {
   els.nodeCount.textContent = state.nodes.length;
   els.onlineCount.textContent = state.nodes.filter((node) => node.status === "online").length;
@@ -807,7 +1185,10 @@ function renderOverview() {
 function renderNodeOverview() {
   els.nodeOverview.replaceChildren();
   if (!state.nodes.length) {
-    els.nodeOverview.appendChild(createTextBlock("div", "empty", t("empty.noAgentSummary")));
+    els.nodeOverview.appendChild(createDataEmptyState(
+      t("empty.noAgentSummary"),
+      t("empty.noAgentsDetail"),
+    ));
     return;
   }
 
@@ -842,8 +1223,10 @@ function renderNodeOverview() {
     const nodeAlerts = state.alerts.filter((alert) => alert.status === "active" && alert.node_id === node.id);
     const footer = document.createElement("span");
     footer.className = "node-overview-footer";
+    const dockerState = createTextBlock("span", "", dockerStatusText(node));
+    dockerState.title = node.docker_inventory_error || "";
     footer.append(
-      createTextBlock("span", "", node.docker_available ? t("docker.available") : t("docker.unavailable")),
+      dockerState,
       createTextBlock("span", nodeAlerts.length ? "alert-mini active" : "alert-mini", t("node.alertCount", { count: nodeAlerts.length })),
     );
 
@@ -891,8 +1274,9 @@ function toggleAlertPanel() {
 
 function renderMetricControls() {
   const canManageThresholds = hasScope("*");
-  els.metricRange.querySelectorAll("[data-range]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.range === state.metricRange);
+  els.metricRange.value = state.metricRange;
+  els.metricSeries.querySelectorAll("[data-metric]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(state.visibleMetrics.includes(button.dataset.metric)));
   });
   els.chartZoomReset.classList.toggle("is-hidden", !state.metricZoom);
   els.thresholdCpu.value = state.thresholds.cpu ?? "";
@@ -902,16 +1286,49 @@ function renderMetricControls() {
     input.disabled = !canManageThresholds;
     input.title = canManageThresholds ? "" : t("readonly.role");
   });
+  renderChartContext();
 }
 
 function changeMetricRange(event) {
-  const button = event.target.closest("[data-range]");
-  if (!button) return;
-  state.metricRange = button.dataset.range;
+  const nextRange = String(event.target.value || "");
+  if (!METRIC_RANGES.has(nextRange) || nextRange === state.metricRange) return;
+  state.metricRange = nextRange;
   clearMetricZoom();
   localStorage.setItem("monitor.metricRange", state.metricRange);
   renderMetricControls();
   refreshAll();
+}
+
+function toggleMetricSeries(event) {
+  const button = event.target.closest("[data-metric]");
+  const metric = button?.dataset.metric;
+  if (!METRIC_KEYS.includes(metric)) return;
+
+  const isVisible = state.visibleMetrics.includes(metric);
+  if (isVisible && state.visibleMetrics.length === 1) {
+    showToast(t("chart.metricRequired"));
+    return;
+  }
+
+  state.visibleMetrics = METRIC_KEYS.filter((key) => (
+    key === metric ? !isVisible : state.visibleMetrics.includes(key)
+  ));
+  localStorage.setItem("monitor.visibleMetrics", JSON.stringify(state.visibleMetrics));
+  hideChartTooltip();
+  renderMetricControls();
+  renderMetricSummary();
+  renderChart(metricsForChart());
+}
+
+function renderChartContext() {
+  if (!els.chartContext) return;
+  const bucket = state.metricPayload?.bucket || (state.metricRange === "1h" ? "raw" : "hour");
+  const sourceKey = bucket === "day" ? "daily" : bucket === "hour" ? "hourly" : "raw";
+  const context = t("chart.context", {
+    source: t(`chart.source.${sourceKey}`),
+    count: metricsForChart().length,
+  });
+  els.chartContext.textContent = state.metricZoom ? `${context} / ${t("chart.zoomed")}` : context;
 }
 
 function updateAuditFilters() {
@@ -993,17 +1410,32 @@ async function saveThresholds() {
   });
 }
 
+async function reloadConfig() {
+  if (!hasScope("*")) {
+    showToast(t("admin.healthUnavailable"));
+    return;
+  }
+
+  els.adminReloadConfig.disabled = true;
+  try {
+    await api("/api/admin/config/reload", { method: "POST" });
+    state.adminHealth = await api("/api/admin/health");
+    renderAdminHealth();
+    showToast(t("admin.configReloaded"));
+  } catch (error) {
+    showToast(t("admin.configReloadFailed", { message: error.message }));
+  } finally {
+    els.adminReloadConfig.disabled = false;
+  }
+}
+
 function renderMetricSummary() {
   els.metricSummary.replaceChildren();
   const summary = state.metricZoom ? summarizeMetrics(metricsForChart()) : state.metricPayload?.summary;
-  const items = [
-    [t("metrics.cpu"), summary?.cpu],
-    [t("metrics.memory"), summary?.memory],
-    [t("metrics.disk"), summary?.disk],
-  ];
-  items.forEach(([label, item]) => {
+  metricDefinitions().forEach(({ id, label }) => {
+    const item = summary?.[id];
     const card = document.createElement("div");
-    card.className = "summary-item";
+    card.className = `summary-item ${id}`;
     card.append(
       createTextBlock("span", "", label),
       createTextBlock("strong", "", t("metrics.avgMax", { avg: percent(item?.avg), max: percent(item?.max) })),
@@ -1013,10 +1445,46 @@ function renderMetricSummary() {
   });
 }
 
+function metricDefinitions() {
+  const definitions = [
+    {
+      id: "cpu",
+      label: t("metrics.cpu"),
+      key: "cpu_percent",
+      avgKey: "cpu_avg",
+      maxKey: "cpu_max",
+      peakKey: "cpu_peak_at",
+      color: cssVar("--blue") || "#1a73e8",
+      threshold: state.thresholds.cpu,
+    },
+    {
+      id: "memory",
+      label: t("metrics.memory"),
+      key: "memory_percent",
+      avgKey: "memory_avg",
+      maxKey: "memory_max",
+      peakKey: "memory_peak_at",
+      color: cssVar("--green") || "#188038",
+      threshold: state.thresholds.memory,
+    },
+    {
+      id: "disk",
+      label: t("metrics.disk"),
+      key: "disk_percent",
+      avgKey: "disk_avg",
+      maxKey: "disk_max",
+      peakKey: "disk_peak_at",
+      color: cssVar("--yellow") || "#f9ab00",
+      threshold: state.thresholds.disk,
+    },
+  ];
+  return definitions.filter((definition) => state.visibleMetrics.includes(definition.id));
+}
+
 function renderNodes() {
   els.nodes.replaceChildren();
   if (!state.nodes.length) {
-    els.nodes.appendChild(createTextBlock("div", "empty", t("node.none")));
+    els.nodes.appendChild(createDataEmptyState(t("node.none"), t("empty.noAgentsDetail"), true));
     return;
   }
 
@@ -1074,24 +1542,31 @@ function renderSelectedNode() {
   els.miniCpu.textContent = percent(node.latest_cpu_percent);
   els.miniMemory.textContent = percent(node.latest_memory_percent);
   els.miniDisk.textContent = percent(node.latest_disk_percent);
-  els.miniDocker.textContent = node.docker_available ? node.docker_version || t("node.available") : t("node.unavailable");
+  els.miniDocker.textContent = node.docker_inventory_status === "stale"
+    ? t("docker.inventoryStale")
+    : node.docker_available
+      ? node.docker_version || t("node.available")
+      : t("node.unavailable");
+  els.miniDocker.title = node.docker_inventory_error || "";
+}
+
+function dockerStatusText(node) {
+  if (node.docker_inventory_status === "stale") return t("docker.inventoryStale");
+  return node.docker_available ? t("docker.available") : t("docker.unavailable");
 }
 
 function renderChart(metrics) {
   const canvas = els.chart;
-  const ctx = canvas.getContext("2d");
-  const width = canvas.width;
-  const height = canvas.height;
-  const left = 52;
-  const right = width - 24;
-  const top = 36;
-  const bottom = height - 48;
+  const surface = resizeChartCanvas(canvas);
+  if (!surface) return;
+  const { ctx, width, height } = surface;
+  const left = 56;
+  const right = width - 20;
+  const top = 38;
+  const bottom = height - 44;
   const colors = chartColors();
-  const series = [
-    ["CPU", "cpu_percent", cssVar("--blue") || "#1a73e8", state.thresholds.cpu],
-    ["Memory", "memory_percent", cssVar("--green") || "#188038", state.thresholds.memory],
-    ["Disk", "disk_percent", cssVar("--yellow") || "#f9ab00", state.thresholds.disk],
-  ];
+  const series = metricDefinitions();
+  const points = buildChartPoints(metrics, left, right);
 
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = colors.bg;
@@ -1108,67 +1583,132 @@ function renderChart(metrics) {
     ctx.moveTo(left, y);
     ctx.lineTo(right, y);
     ctx.stroke();
-    ctx.fillText(String(value), 16, y + 4);
+    ctx.textAlign = "right";
+    ctx.fillText(`${value}%`, left - 10, y + 4);
   }
 
-  drawTimeAxis(ctx, metrics, left, right, bottom);
-  drawLegend(ctx, series);
+  drawTimeAxis(ctx, points, left, right, bottom);
   drawThresholds(ctx, series, left, right, top, bottom);
   state.chartModel = {
     left,
     right,
     top,
     bottom,
-    points: metrics.map((point, index) => ({
-      point,
-      x: left + ((right - left) * index) / Math.max(1, metrics.length - 1),
-    })),
+    points,
+    series,
   };
+  renderChartContext();
 
   if (!metrics.length) {
     ctx.fillStyle = colors.text;
     ctx.font = "14px system-ui";
+    ctx.textAlign = "left";
     ctx.fillText(t("chart.noMetrics"), left, 86);
     return;
   }
 
-  series.forEach((item) => drawSeries(ctx, metrics, item[1], item[2], left, right, top, bottom));
+  series.forEach((definition) => drawSeries(ctx, points, definition, top, bottom, series.length === 1));
+  drawChartHover(ctx, points, series, top, bottom);
   drawChartSelection(ctx, left, right, top, bottom);
 }
 
-function drawSeries(ctx, metrics, key, color, left, right, top, bottom) {
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 2.5;
-  ctx.beginPath();
-  metrics.forEach((point, index) => {
-    const value = Number(point[key] || 0);
-    const x = left + ((right - left) * index) / Math.max(1, metrics.length - 1);
-    const y = yForValue(value, top, bottom);
-    if (index === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
+function resizeChartCanvas(canvas) {
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.round(rect.width);
+  const height = Math.round(rect.height);
+  if (width < 280 || height < 220) return null;
+  const ratio = Math.min(2, window.devicePixelRatio || 1);
+  const pixelWidth = Math.round(width * ratio);
+  const pixelHeight = Math.round(height * ratio);
+  if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+  if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  return { ctx, width, height };
 }
 
-function drawLegend(ctx, items) {
-  const colors = chartColors();
-  ctx.font = "12px system-ui";
-  items.forEach((item, index) => {
-    const x = 56 + index * 96;
-    ctx.fillStyle = item[2];
-    ctx.fillRect(x, 17, 18, 4);
-    ctx.fillStyle = colors.ink;
-    ctx.fillText(item[0], x + 24, 22);
+function buildChartPoints(metrics, left, right) {
+  const timestamps = metrics.map(pointTime);
+  const validTimes = timestamps.filter((value) => value !== null);
+  const minimum = validTimes.length ? Math.min(...validTimes) : null;
+  const maximum = validTimes.length ? Math.max(...validTimes) : null;
+  return metrics.map((point, index) => {
+    const timestamp = timestamps[index];
+    const ratio = timestamp !== null && minimum !== null && maximum !== null && maximum > minimum
+      ? (timestamp - minimum) / (maximum - minimum)
+      : index / Math.max(1, metrics.length - 1);
+    return { point, x: left + (right - left) * ratio };
   });
+}
+
+function drawSeries(ctx, points, definition, top, bottom, fillArea) {
+  const coordinates = points.flatMap(({ point, x }) => {
+    const value = metricNumber(point[definition.key] ?? point[definition.avgKey]);
+    return Number.isFinite(value) ? [{ x, y: yForValue(value, top, bottom) }] : [];
+  });
+  if (!coordinates.length) return;
+
+  ctx.save();
+  if (fillArea && coordinates.length > 1) {
+    const gradient = ctx.createLinearGradient(0, top, 0, bottom);
+    gradient.addColorStop(0, colorWithAlpha(definition.color, 0.18));
+    gradient.addColorStop(1, colorWithAlpha(definition.color, 0.015));
+    ctx.beginPath();
+    ctx.moveTo(coordinates[0].x, bottom);
+    ctx.lineTo(coordinates[0].x, coordinates[0].y);
+    traceSmoothLine(ctx, coordinates);
+    ctx.lineTo(coordinates.at(-1).x, bottom);
+    ctx.closePath();
+    ctx.fillStyle = gradient;
+    ctx.fill();
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(coordinates[0].x, coordinates[0].y);
+  traceSmoothLine(ctx, coordinates);
+  ctx.strokeStyle = definition.color;
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.shadowColor = colorWithAlpha(definition.color, 0.18);
+  ctx.shadowBlur = 5;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  if (coordinates.length <= 40) {
+    coordinates.forEach(({ x, y }) => {
+      ctx.beginPath();
+      ctx.arc(x, y, 2.4, 0, Math.PI * 2);
+      ctx.fillStyle = chartColors().bg;
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = definition.color;
+      ctx.stroke();
+    });
+  }
+  ctx.restore();
+}
+
+function traceSmoothLine(ctx, coordinates) {
+  if (coordinates.length < 2) return;
+  for (let index = 1; index < coordinates.length; index += 1) {
+    const previous = coordinates[index - 1];
+    const current = coordinates[index];
+    const midpointX = (previous.x + current.x) / 2;
+    const midpointY = (previous.y + current.y) / 2;
+    ctx.quadraticCurveTo(previous.x, previous.y, midpointX, midpointY);
+  }
+  const last = coordinates.at(-1);
+  ctx.lineTo(last.x, last.y);
 }
 
 function drawThresholds(ctx, items, left, right, top, bottom) {
   ctx.save();
   items.forEach((item) => {
-    const threshold = Number(item[3]);
+    const threshold = Number(item.threshold);
     if (!Number.isFinite(threshold)) return;
     const y = yForValue(threshold, top, bottom);
-    ctx.strokeStyle = item[2];
+    ctx.strokeStyle = colorWithAlpha(item.color, 0.62);
     ctx.lineWidth = 1.4;
     ctx.setLineDash([6, 5]);
     ctx.beginPath();
@@ -1176,14 +1716,15 @@ function drawThresholds(ctx, items, left, right, top, bottom) {
     ctx.lineTo(right, y);
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = item[2];
+    ctx.fillStyle = item.color;
     ctx.font = "12px system-ui";
-    ctx.fillText(`${item[0]} ${threshold}%`, right - 86, y - 6);
+    ctx.textAlign = "right";
+    ctx.fillText(`${item.label} ${threshold}%`, right, y - 7);
   });
   ctx.restore();
 }
 
-function drawTimeAxis(ctx, metrics, left, right, bottom) {
+function drawTimeAxis(ctx, points, left, right, bottom) {
   const colors = chartColors();
   ctx.save();
   ctx.strokeStyle = colors.grid;
@@ -1197,20 +1738,51 @@ function drawTimeAxis(ctx, metrics, left, right, bottom) {
   ctx.lineTo(right, bottom);
   ctx.stroke();
 
-  pickAxisIndexes(metrics.length).forEach((index) => {
-    const point = metrics[index];
-    const x = left + ((right - left) * index) / Math.max(1, metrics.length - 1);
+  pickAxisIndexes(points.length).forEach((index) => {
+    const item = points[index];
+    const x = item.x;
     ctx.beginPath();
     ctx.moveTo(x, bottom);
     ctx.lineTo(x, bottom + 6);
     ctx.stroke();
 
     if (index === 0) ctx.textAlign = "left";
-    else if (index === metrics.length - 1) ctx.textAlign = "right";
+    else if (index === points.length - 1) ctx.textAlign = "right";
     else ctx.textAlign = "center";
-    ctx.fillText(formatAxisLabel(point?.captured_at || point?.bucket_start), x, bottom + 10);
+    ctx.fillText(formatAxisLabel(item.point?.captured_at || item.point?.bucket_start), x, bottom + 10);
   });
 
+  ctx.restore();
+}
+
+function drawChartHover(ctx, points, series, top, bottom) {
+  if (state.chartHoverX === null || !points.length || state.chartSelection) return;
+  const nearest = nearestChartPoint(points, state.chartHoverX);
+  if (!nearest) return;
+  const colors = chartColors();
+
+  ctx.save();
+  ctx.strokeStyle = colors.hover;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 4]);
+  ctx.beginPath();
+  ctx.moveTo(nearest.x, top);
+  ctx.lineTo(nearest.x, bottom);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  series.forEach((definition) => {
+    const value = metricNumber(nearest.point[definition.key] ?? nearest.point[definition.avgKey]);
+    if (!Number.isFinite(value)) return;
+    const y = yForValue(value, top, bottom);
+    ctx.beginPath();
+    ctx.arc(nearest.x, y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = colors.bg;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = definition.color;
+    ctx.stroke();
+  });
   ctx.restore();
 }
 
@@ -1333,8 +1905,7 @@ function nearestChartPoint(points, x) {
 
 function chartEventX(event) {
   const rect = els.chart.getBoundingClientRect();
-  const scaleX = els.chart.width / rect.width;
-  return (event.clientX - rect.left) * scaleX;
+  return event.clientX - rect.left;
 }
 
 function pointTime(point) {
@@ -1395,7 +1966,7 @@ function formatAxisLabel(value) {
   if (state.metricRange === "1h") {
     return date.toLocaleTimeString(locale(), { hour: "2-digit", minute: "2-digit" });
   }
-  if (state.metricRange === "7d") {
+  if (state.metricRange === "24h") {
     return date.toLocaleString(locale(), { month: "2-digit", day: "2-digit", hour: "2-digit" });
   }
   return date.toLocaleDateString(locale(), { month: "2-digit", day: "2-digit" });
@@ -1410,8 +1981,13 @@ function renderContainers() {
   els.containers.replaceChildren();
   if (!state.containers.length) {
     const row = document.createElement("tr");
-    const cell = createTextBlock("td", "empty", t("containers.noneVisible"));
+    row.className = "table-empty-row";
+    const cell = document.createElement("td");
     cell.colSpan = 6;
+    cell.appendChild(createDataEmptyState(
+      t("containers.noneVisible"),
+      t("empty.noContainersDetail"),
+    ));
     row.appendChild(cell);
     els.containers.appendChild(row);
     return;
@@ -1420,8 +1996,10 @@ function renderContainers() {
   const filtered = state.containers.filter(containerMatchesFilters);
   if (!filtered.length) {
     const row = document.createElement("tr");
-    const cell = createTextBlock("td", "empty", t("containers.noMatches"));
+    row.className = "table-empty-row";
+    const cell = document.createElement("td");
     cell.colSpan = 6;
+    cell.appendChild(createEmptyState(t("containers.noMatches"), ""));
     row.appendChild(cell);
     els.containers.appendChild(row);
     return;
@@ -1431,26 +2009,39 @@ function renderContainers() {
     const row = document.createElement("tr");
     const name = createTextBlock("td", "name-cell", container.name || container.container_id);
     name.title = String(container.container_id || "");
+    setTableCellLabel(name, t("table.name"));
 
     const statusCell = document.createElement("td");
+    setTableCellLabel(statusCell, t("table.status"));
     statusCell.appendChild(createTextBlock("span", `status-chip ${statusClass(container.status)}`, container.status || "-"));
 
     const actions = createContainerActions(container);
+    setTableCellLabel(actions, t("table.actions"));
+    const image = createTextBlock("td", "", container.image || "-");
+    const cpu = createTextBlock("td", "", percent(container.cpu_percent));
+    const memory = createTextBlock(
+      "td",
+      "",
+      `${bytes(container.memory_usage)}${container.memory_limit ? ` / ${bytes(container.memory_limit)}` : ""}`,
+    );
+    setTableCellLabel(image, t("table.image"));
+    setTableCellLabel(cpu, t("metrics.cpu"));
+    setTableCellLabel(memory, t("metrics.memory"));
 
     row.append(
       name,
-      createTextBlock("td", "", container.image || "-"),
+      image,
       statusCell,
-      createTextBlock("td", "", percent(container.cpu_percent)),
-      createTextBlock(
-        "td",
-        "",
-        `${bytes(container.memory_usage)}${container.memory_limit ? ` / ${bytes(container.memory_limit)}` : ""}`,
-      ),
+      cpu,
+      memory,
       actions,
     );
     els.containers.appendChild(row);
   });
+}
+
+function setTableCellLabel(cell, label) {
+  cell.dataset.label = String(label || "");
 }
 
 function createContainerActions(container) {
@@ -1568,6 +2159,7 @@ function renderEvents() {
     (item) => `${item.action} / ${item.status}`,
     (item) => `${item.node_id} / ${item.created_at} / ${item.result_message || ""}`,
     t("commands.none"),
+    t("empty.noCommandsDetail"),
   );
   renderEventList(
     els.auditLogs,
@@ -1575,6 +2167,7 @@ function renderEvents() {
     (item) => `${item.action} / ${item.result || ""}`,
     (item) => `${item.user} / ${item.node_id || "-"} / ${item.client_ip || "-"} / ${item.created_at}`,
     t("audit.none"),
+    t("empty.noAuditDetail"),
   );
 }
 
@@ -1593,10 +2186,10 @@ function exportAuditCsv() {
   URL.revokeObjectURL(url);
 }
 
-function renderEventList(target, items, title, detail, emptyText) {
+function renderEventList(target, items, title, detail, emptyText, emptyDetail) {
   target.replaceChildren();
   if (!items.length) {
-    target.appendChild(createTextBlock("div", "empty", emptyText));
+    target.appendChild(createDataEmptyState(emptyText, emptyDetail));
     return;
   }
   items.forEach((item) => {
@@ -1610,6 +2203,47 @@ function renderEventList(target, items, title, detail, emptyText) {
   });
 }
 
+function createDataEmptyState(title, detail, compact = false) {
+  if (state.isLoading) {
+    return createEmptyState(t("empty.loadingTitle"), t("empty.loadingDetail"), {
+      compact,
+      variant: "loading",
+    });
+  }
+  if (state.refreshError && !state.hasLoaded) {
+    return createEmptyState(t("empty.errorTitle"), t("empty.errorDetail"), {
+      action: t("empty.retry"),
+      compact,
+      variant: "error",
+    });
+  }
+  return createEmptyState(title, detail, { compact });
+}
+
+function createEmptyState(title, detail, options = {}) {
+  const container = document.createElement("div");
+  const variant = options.variant || "neutral";
+  container.className = `empty-state ${variant}${options.compact ? " compact" : ""}`;
+
+  const marker = document.createElement("span");
+  marker.className = "empty-state-marker";
+  marker.setAttribute("aria-hidden", "true");
+
+  const copy = document.createElement("div");
+  copy.className = "empty-state-copy";
+  copy.appendChild(createTextBlock("strong", "", title));
+  if (detail) copy.appendChild(createTextBlock("span", "", detail));
+  container.append(marker, copy);
+
+  if (options.action) {
+    const action = createTextBlock("button", "empty-state-action", options.action);
+    action.type = "button";
+    action.addEventListener("click", refreshAll);
+    container.appendChild(action);
+  }
+  return container;
+}
+
 function createTextBlock(tagName, className, text) {
   const element = document.createElement(tagName);
   if (className) element.className = className;
@@ -1618,6 +2252,7 @@ function createTextBlock(tagName, className, text) {
 }
 
 function statusClass(value) {
+  if (String(value || "").toLowerCase() === "send_failed") return "failed";
   const allowed = new Set([
     "online",
     "warning",
@@ -1654,20 +2289,27 @@ function showChartTooltip(event) {
   }
 
   const rect = els.chart.getBoundingClientRect();
-  const scaleX = els.chart.width / rect.width;
-  const x = (event.clientX - rect.left) * scaleX;
-  const nearest = model.points.reduce((best, item) => (
-    Math.abs(item.x - x) < Math.abs(best.x - x) ? item : best
-  ));
+  const x = event.clientX - rect.left;
+  const nearest = nearestChartPoint(model.points, x);
+  state.chartHoverX = nearest.x;
+  renderChart(metricsForChart());
 
   const point = nearest.point;
-  els.chartTooltip.replaceChildren(
+  const tooltipLines = [
     createTextBlock("strong", "", formatBucket(point)),
     createTextBlock("span", "", t("metrics.samples", { count: point.sample_count || 0 })),
-    createTextBlock("span", "", metricTooltipLine(t("metrics.cpu"), point.cpu_avg, point.cpu_max, point.cpu_peak_at)),
-    createTextBlock("span", "", metricTooltipLine(t("metrics.memory"), point.memory_avg, point.memory_max, point.memory_peak_at)),
-    createTextBlock("span", "", metricTooltipLine(t("metrics.disk"), point.disk_avg, point.disk_max, point.disk_peak_at)),
-  );
+    ...metricDefinitions().map((definition) => createTextBlock(
+      "span",
+      "",
+      metricTooltipLine(
+        definition.label,
+        point[definition.avgKey] ?? point[definition.key],
+        point[definition.maxKey] ?? point[definition.key],
+        point[definition.peakKey] ?? point.captured_at ?? point.bucket_start,
+      ),
+    )),
+  ];
+  els.chartTooltip.replaceChildren(...tooltipLines);
   els.chartTooltip.classList.remove("is-hidden");
   const tooltipWidth = Math.min(300, Math.max(220, rect.width - 24));
   let left = event.clientX - rect.left + 14;
@@ -1680,6 +2322,10 @@ function showChartTooltip(event) {
 
 function hideChartTooltip() {
   els.chartTooltip.classList.add("is-hidden");
+  if (state.chartHoverX !== null) {
+    state.chartHoverX = null;
+    renderChart(metricsForChart());
+  }
 }
 
 function metricTooltipLine(label, avg, max, peakAt) {
@@ -1703,6 +2349,30 @@ function formatDateTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString(locale());
+}
+
+function seconds(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return `${number}s`;
+}
+
+function days(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return `${number}d`;
+}
+
+function pendingCommandsText(value) {
+  return `${value} ${t("admin.pendingCommands")}`;
+}
+
+function compactPath(value) {
+  const text = String(value || "");
+  if (!text) return "-";
+  const parts = text.split(/[\\/]/).filter(Boolean);
+  if (parts.length <= 2) return text;
+  return `.../${parts.slice(-2).join("/")}`;
 }
 
 function loadThresholds() {
@@ -1733,12 +2403,27 @@ function loadLanguage() {
   return navigator.language?.toLowerCase().startsWith("zh") ? "zh" : "en";
 }
 
+function loadMetricRange() {
+  const stored = localStorage.getItem("monitor.metricRange");
+  return METRIC_RANGES.has(stored) ? stored : "1h";
+}
+
+function loadVisibleMetrics() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem("monitor.visibleMetrics") || "[]");
+    const metrics = METRIC_KEYS.filter((key) => parsed.includes(key));
+    return metrics.length ? metrics : [...METRIC_KEYS];
+  } catch {
+    return [...METRIC_KEYS];
+  }
+}
+
 function loadPage() {
   return normalizePage(window.location.hash.slice(1) || localStorage.getItem("monitor.currentPage"));
 }
 
 function normalizePage(page) {
-  const allowed = new Set(["overview", "containers", "commands", "audit"]);
+  const allowed = new Set(["overview", "containers", "commands", "audit", "admin"]);
   return allowed.has(page) ? page : "overview";
 }
 
@@ -1758,11 +2443,28 @@ function chartColors() {
     grid: cssVar("--chart-grid") || "#e0e3eb",
     text: cssVar("--chart-text") || "#5f6368",
     ink: cssVar("--chart-ink") || "#202124",
+    hover: cssVar("--chart-hover") || "rgba(95, 99, 104, 0.5)",
   };
 }
 
 function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function colorWithAlpha(color, alpha) {
+  const value = String(color || "").trim();
+  const shortHex = /^#([0-9a-f]{3})$/i.exec(value);
+  const longHex = /^#([0-9a-f]{6})$/i.exec(value);
+  const rgb = /^rgba?\((\d+)[, ]+(\d+)[, ]+(\d+)/i.exec(value);
+  let channels = null;
+  if (shortHex) {
+    channels = [...shortHex[1]].map((channel) => parseInt(channel + channel, 16));
+  } else if (longHex) {
+    channels = [0, 2, 4].map((offset) => parseInt(longHex[1].slice(offset, offset + 2), 16));
+  } else if (rgb) {
+    channels = rgb.slice(1, 4).map(Number);
+  }
+  return channels ? `rgba(${channels.join(", ")}, ${alpha})` : value;
 }
 
 function normalizeThresholdPayload(value) {

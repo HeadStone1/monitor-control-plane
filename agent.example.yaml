@@ -12,7 +12,17 @@ intervals:
   docker_inventory: 30
   host_info: 60
 
+reconnect:
+  initial_seconds: 1
+  max_seconds: 30
+  stable_reset_seconds: 60
+  jitter_percent: 20
+  auth_timeout_seconds: 5
+
 docker:
   enabled: true
+  api_timeout_seconds: 10
+  collection_timeout_seconds: 15
+  collection_workers: 3
   allowed_labels:
     monitor.control-plane.allow: "true"
