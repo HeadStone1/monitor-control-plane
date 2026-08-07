@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -189,6 +190,19 @@ def login(client: TestClient, username: str = "admin", password: str = "admin-pa
     )
     assert response.status_code == 200
     return str(response.json()["csrf_token"])
+
+
+def _write_private_agent_config(path: Path, content: str) -> None:
+    """Write an agent config file with POSIX-restrictive permissions.
+
+    ``load_agent_config`` refuses config files readable by group/others on
+    non-Windows platforms. Helper tests that materialise ``agent.yaml`` in a
+    tmp_path must therefore tighten permissions, otherwise the call fails on
+    Linux (umask 022 -> 0644) but passes on Windows where the check is skipped.
+    """
+    path.write_text(content, encoding="utf-8")
+    if os.name != "nt":
+        path.chmod(0o600)
 
 
 def test_hash_secret_generates_argon2id_and_rejects_legacy_pbkdf2() -> None:
@@ -1276,7 +1290,8 @@ def test_blocking_collection_does_not_block_event_loop_or_duplicate_after_timeou
 
 def test_agent_docker_timeout_config_is_bounded(tmp_path: Path) -> None:
     config_path = tmp_path / "agent.yaml"
-    config_path.write_text(
+    _write_private_agent_config(
+        config_path,
         "\n".join(
             [
                 "docker:",
@@ -1285,7 +1300,6 @@ def test_agent_docker_timeout_config_is_bounded(tmp_path: Path) -> None:
                 "  collection_workers: 4",
             ]
         ),
-        encoding="utf-8",
     )
 
     loaded = load_agent_config(str(config_path))
@@ -1293,14 +1307,15 @@ def test_agent_docker_timeout_config_is_bounded(tmp_path: Path) -> None:
     assert loaded.docker.collection_timeout_seconds == 20
     assert loaded.docker.collection_workers == 4
 
-    config_path.write_text("docker:\n  collection_workers: 0\n", encoding="utf-8")
+    _write_private_agent_config(config_path, "docker:\n  collection_workers: 0\n")
     with pytest.raises(ValueError, match="between 1 and 8"):
         load_agent_config(str(config_path))
 
 
 def test_agent_reconnect_config_is_bounded(tmp_path: Path) -> None:
     config_path = tmp_path / "agent.yaml"
-    config_path.write_text(
+    _write_private_agent_config(
+        config_path,
         "\n".join(
             [
                 "reconnect:",
@@ -1311,14 +1326,22 @@ def test_agent_reconnect_config_is_bounded(tmp_path: Path) -> None:
                 "  auth_timeout_seconds: 8",
             ]
         ),
-        encoding="utf-8",
     )
 
     loaded = load_agent_config(str(config_path))
     assert loaded.reconnect == ReconnectConfig(2, 45, 90, 25, 8)
 
-    config_path.write_text("reconnect:\n  initial_seconds: 10\n  max_seconds: 5\n", encoding="utf-8")
+    _write_private_agent_config(config_path, "reconnect:\n  initial_seconds: 10\n  max_seconds: 5\n")
     with pytest.raises(ValueError, match="max_seconds"):
+        load_agent_config(str(config_path))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only permission check")
+def test_agent_config_requires_strict_permissions(tmp_path: Path) -> None:
+    config_path = tmp_path / "agent.yaml"
+    config_path.write_text("reconnect:\n  initial_seconds: 1\n", encoding="utf-8")
+    config_path.chmod(0o644)
+    with pytest.raises(RuntimeError, match="chmod 600"):
         load_agent_config(str(config_path))
 
 
